@@ -428,7 +428,9 @@ async def already_processed(message):
 
 async def get_processed_count(message):
     """Gibt zurueck wie viele Bilder bereits verarbeitet wurden (anhand Zahlen-Emojis vom Bot)."""
-    for reaction in message.reactions:
+    # Nachricht neu laden damit Reaktionen aktuell sind
+    fresh = await message.channel.fetch_message(message.id)
+    for reaction in fresh.reactions:
         emoji_str = str(reaction.emoji)
         if emoji_str in NUMBER_EMOJIS:
             async for user in reaction.users():
@@ -438,11 +440,19 @@ async def get_processed_count(message):
 
 async def remove_number_reactions(message):
     """Entfernt alle Zahlen-Emojis des Bots von einer Nachricht."""
-    for reaction in message.reactions:
+    # Kopie der Reaktionsliste damit wir waehrend Iteration entfernen koennen
+    fresh = await message.channel.fetch_message(message.id)
+    to_remove = []
+    for reaction in fresh.reactions:
         if str(reaction.emoji) in NUMBER_EMOJIS:
             async for user in reaction.users():
                 if user.id == discord_client.user.id:
-                    await message.remove_reaction(reaction.emoji, discord_client.user)
+                    to_remove.append(reaction.emoji)
+    for emoji in to_remove:
+        try:
+            await message.remove_reaction(emoji, discord_client.user)
+        except Exception as e:
+            log.warning(f"Konnte Reaktion {emoji} nicht entfernen: {e}")
 
 async def process_image(message, attachment):
     """
