@@ -212,7 +212,8 @@ def update_fastest_lap(sheet, rennen, new_driver, new_time_int):
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 GENERATION_CONFIG = genai.GenerationConfig(temperature=0)
 
 PROMPT_EXTRACT = (
@@ -273,7 +274,7 @@ def call_gemini(img, prompt):
     except ResourceExhausted as e:
         log.error(f"Gemini ResourceExhausted - Details: {str(e)}")
         gemini_blocked_until = datetime.now() + timedelta(minutes=GEMINI_BACKOFF_MINUTES)
-        log.error(f"Gemini-Kontingent erschoepft. Sperre bis {gemini_blocked_until.strftime('%H:%M')} Uhr")
+        log.error(f"Gemini-Kontingent erschoepft. Sperre fuer {GEMINI_BACKOFF_MINUTES} Minuten.")
         raise GeminiQuotaError("Gemini-Kontingent erschoepft") from e
     except Exception as e:
         log.error(f"Gemini unerwarteter Fehler ({type(e).__name__}): {str(e)}")
@@ -435,9 +436,8 @@ async def process_image(message, attachment):
 
     except GeminiQuotaError:
         # Kein Error-Emoji setzen – Bild soll spaeter nochmal verarbeitet werden
-        until_str = gemini_blocked_until.strftime("%H:%M") if gemini_blocked_until else "unbekannt"
         await channel.send(
-            f"Gemini-Tageskontingent erschoepft. Auswertung pausiert bis ca. {until_str} Uhr. "
+            f"Gemini-Tageskontingent erschoepft. Auswertung pausiert fuer ca. {GEMINI_BACKOFF_MINUTES} Minuten. "
             f"Bild wird dann automatisch verarbeitet."
         )
         log.warning("Verarbeitung wegen Quota-Fehler abgebrochen, kein Emoji gesetzt.")
@@ -466,8 +466,7 @@ async def scan_channel():
         try:
             # Wenn Gemini gesperrt ist, Scan komplett ueberspringen
             if gemini_is_blocked():
-                until_str = gemini_blocked_until.strftime("%H:%M")
-                log.info(f"Gemini gesperrt bis {until_str}, ueberspringe Scan.")
+                log.info(f"Gemini gesperrt, ueberspringe Scan. Noch ca. {int((gemini_blocked_until - datetime.now()).total_seconds() / 60)} Minuten.")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
