@@ -1,4 +1,4 @@
-discord.py==2.3.2
+discord.py>=2.4.0
 gspread==6.1.2
 google-auth==2.29.0
 google-generativeai==0.7.2
