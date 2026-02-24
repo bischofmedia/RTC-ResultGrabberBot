@@ -271,9 +271,13 @@ def call_gemini(img, prompt):
         text = re.sub(r"\s*```$", "", text)
         return json.loads(text)
     except ResourceExhausted as e:
+        log.error(f"Gemini ResourceExhausted - Details: {str(e)}")
         gemini_blocked_until = datetime.now() + timedelta(minutes=GEMINI_BACKOFF_MINUTES)
         log.error(f"Gemini-Kontingent erschoepft. Sperre bis {gemini_blocked_until.strftime('%H:%M')} Uhr")
         raise GeminiQuotaError("Gemini-Kontingent erschoepft") from e
+    except Exception as e:
+        log.error(f"Gemini unerwarteter Fehler ({type(e).__name__}): {str(e)}")
+        raise
 
 def gemini_is_blocked():
     """Prueft ob die Gemini-Sperre noch aktiv ist."""
