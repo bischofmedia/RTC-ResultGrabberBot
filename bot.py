@@ -33,6 +33,11 @@ POLL_INTERVAL = 15
 DONE_EMOJI    = "\u2705"
 ERROR_EMOJI   = "\u274c"
 
+# Zahlen-Emojis fuer Fortschrittsanzeige bei mehreren Bildern
+NUMBER_EMOJIS = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3",
+                 "5\ufe0f\u20e3", "6\ufe0f\u20e3", "7\ufe0f\u20e3", "8\ufe0f\u20e3",
+                 "9\ufe0f\u20e3", "\U0001f51f"]
+
 # Gemini-Quota-Sperre (in-memory, wird gesetzt wenn Kontingent erschoepft)
 gemini_blocked_until = None
 
@@ -413,6 +418,7 @@ intents.reactions = True
 discord_client = discord.Client(intents=intents)
 
 async def already_processed(message):
+    """Prueft ob alle Bilder der Nachricht verarbeitet wurden (gruener Haken oder X vom Bot)."""
     for reaction in message.reactions:
         if str(reaction.emoji) in (DONE_EMOJI, ERROR_EMOJI):
             async for user in reaction.users():
@@ -420,7 +426,29 @@ async def already_processed(message):
                     return True
     return False
 
+async def get_processed_count(message):
+    """Gibt zurueck wie viele Bilder bereits verarbeitet wurden (anhand Zahlen-Emojis vom Bot)."""
+    for reaction in message.reactions:
+        emoji_str = str(reaction.emoji)
+        if emoji_str in NUMBER_EMOJIS:
+            async for user in reaction.users():
+                if user.id == discord_client.user.id:
+                    return NUMBER_EMOJIS.index(emoji_str) + 1
+    return 0
+
+async def remove_number_reactions(message):
+    """Entfernt alle Zahlen-Emojis des Bots von einer Nachricht."""
+    for reaction in message.reactions:
+        if str(reaction.emoji) in NUMBER_EMOJIS:
+            async for user in reaction.users():
+                if user.id == discord_client.user.id:
+                    await message.remove_reaction(reaction.emoji, discord_client.user)
+
 async def process_image(message, attachment):
+    """
+    Verarbeitet ein einzelnes Bild. Gibt (elapsed, success) zurueck.
+    success=None bedeutet Quota-Fehler (kein Emoji setzen).
+    """
     log.info(f"Verarbeite: {attachment.filename} von {message.author}")
     channel = message.channel
     started = asyncio.get_event_loop().time()
@@ -428,6 +456,7 @@ async def process_image(message, attachment):
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp_path = f.name
 
+    success = False
     try:
         img_data = requests.get(attachment.url).content
         with open(tmp_path, "wb") as f:
@@ -440,28 +469,28 @@ async def process_image(message, attachment):
         for w in warnings:
             await channel.send(w)
 
-        await message.add_reaction(DONE_EMOJI)
         elapsed = asyncio.get_event_loop().time() - started
         log.info(f"Erfolgreich verarbeitet in {elapsed:.1f}s. {len(warnings)} Warnung(en).")
+        success = True
 
     except GeminiQuotaError:
-        # Kein Error-Emoji setzen – Bild soll spaeter nochmal verarbeitet werden
         await channel.send(
             f"Gemini-Tageskontingent erschoepft. Auswertung pausiert fuer ca. {GEMINI_BACKOFF_MINUTES} Minuten. "
             f"Bild wird dann automatisch verarbeitet."
         )
         log.warning("Verarbeitung wegen Quota-Fehler abgebrochen, kein Emoji gesetzt.")
+        success = None   # Kein Emoji – spaeter nochmal versuchen
 
     except Exception as e:
         log.error(f"Fehler: {e}", exc_info=True)
-        await message.add_reaction(ERROR_EMOJI)
         await channel.send(f"Fehler bei der Verarbeitung: {type(e).__name__}: {str(e)[:200]}")
+        success = False
 
     finally:
         elapsed = asyncio.get_event_loop().time() - started
         os.unlink(tmp_path)
 
-    return elapsed
+    return elapsed, success
 
 async def scan_channel():
     await discord_client.wait_until_ready()
@@ -488,14 +517,44 @@ async def scan_channel():
                 ]
                 if not attachments:
                     continue
+                # Vollstaendig verarbeitet (Haken oder X) -> ueberspringen
                 if await already_processed(message):
                     continue
 
-                elapsed = await process_image(message, attachments[0])
+                # Wieviele Bilder wurden bereits verarbeitet?
+                processed_count = await get_processed_count(message)
+                total           = len(attachments)
+
+                # Naechstes noch nicht verarbeitetes Bild
+                next_index = processed_count
+                if next_index >= total:
+                    continue   # Alle verarbeitet aber noch kein Haken – Sicherheitsnetz
+
+                attachment = attachments[next_index]
+                elapsed, success = await process_image(message, attachment)
 
                 # Nach Quota-Fehler sofort Scan-Schleife verlassen
                 if gemini_is_blocked():
                     break
+
+                if success is True:
+                    new_count = processed_count + 1
+                    # Altes Zahlen-Emoji entfernen
+                    await remove_number_reactions(message)
+
+                    if new_count >= total:
+                        # Alle Bilder verarbeitet -> gruener Haken
+                        await message.add_reaction(DONE_EMOJI)
+                        log.info(f"Alle {total} Bilder verarbeitet.")
+                    else:
+                        # Noch nicht alle -> Zahl setzen
+                        await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
+                        log.info(f"Bild {new_count}/{total} verarbeitet.")
+                elif success is False:
+                    # Fehler -> X setzen
+                    await remove_number_reactions(message)
+                    await message.add_reaction(ERROR_EMOJI)
+                # success is None -> Quota, kein Emoji
 
                 # Mindestens POLL_INTERVAL Sekunden zwischen zwei Auswertungen
                 remaining = POLL_INTERVAL - (elapsed or 0)
