@@ -329,7 +329,7 @@ def analyse_image(image_path):
 # ── Ergebnisse ins Sheet schreiben ────────────────────────────────────────────
 def write_results(sheet, data):
     """
-    Schreibt Ergebnisse ins Sheet.
+    Schreibt Ergebnisse ins Sheet via Batch-Update.
     Gibt Liste von Discord-Warnmeldungen zurueck.
     """
     rennen      = int(data["rennen"])
@@ -340,14 +340,18 @@ def write_results(sheet, data):
     block = resolve_block(sheet, rennen, grid_label)
     log.info(f"Rennen {rennen}, Grid '{grid_label}' -> Block {block}")
 
-    r, c = get_grid_label_cell(rennen, block)
-    sheet.update_cell(r, c, grid_label)
-    time.sleep(0.2)
-
     delta_errors = validate_deltas(fahrer_list)
 
     fastest_time_int   = None
     fastest_lap_driver = None
+
+    # Alle Zellwerte sammeln fuer Batch-Update
+    # Format: { "A1": value, "B2": value, ... }
+    batch = {}
+
+    # Grid-Label
+    r, c = get_grid_label_cell(rennen, block)
+    batch[rowcol_to_a1(r, c)] = grid_label
 
     for fahrer in sorted(fahrer_list, key=lambda x: x["position"]):
         pos         = int(fahrer["position"])
@@ -361,18 +365,12 @@ def write_results(sheet, data):
         log.info(f"  P{pos} {name} | {auto} | racetime={racetime} "
                  f"laps={laps} fl={beste_runde}")
 
-        sheet.update_cell(*get_cell(rennen, block, pos, "driver"),   name)
-        time.sleep(0.1)
-        sheet.update_cell(*get_cell(rennen, block, pos, "car"),      auto)
-        time.sleep(0.1)
-        sheet.update_cell(*get_cell(rennen, block, pos, "racetime"), racetime or "")
-        time.sleep(0.1)
-        sheet.update_cell(*get_cell(rennen, block, pos, "laps"),     laps or "")
-        time.sleep(0.1)
+        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "driver"))]   = name
+        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "car"))]      = auto
+        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "racetime"))] = racetime or ""
+        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "laps"))]     = laps or ""
 
         if pos in delta_errors:
-            mark_red(sheet, rennen, block, pos)
-            time.sleep(0.1)
             warnings.append(
                 f"Grid {grid_label}, Pos {pos}, {name}: Zeit ist zu pruefen"
             )
@@ -390,6 +388,18 @@ def write_results(sheet, data):
                     fastest_time_int   = br_int
                     fastest_lap_driver = name
 
+    # Einen einzigen Batch-Update an die Sheets API
+    sheet.batch_update([
+        {"range": addr, "values": [[val]]}
+        for addr, val in batch.items()
+    ])
+    log.info(f"Batch-Update: {len(batch)} Zellen geschrieben")
+
+    # Rote Markierung fuer Delta-Fehler (muss separat, da Formatierung kein Wert-Update ist)
+    for pos in delta_errors:
+        mark_red(sheet, rennen, block, pos)
+
+    # Schnellste Runde aktualisieren
     if fastest_lap_driver and fastest_time_int is not None:
         update_fastest_lap(sheet, rennen, fastest_lap_driver, fastest_time_int)
 
@@ -445,6 +455,7 @@ async def process_image(message, attachment):
     except Exception as e:
         log.error(f"Fehler: {e}", exc_info=True)
         await message.add_reaction(ERROR_EMOJI)
+        await channel.send(f"Fehler bei der Verarbeitung: {type(e).__name__}: {str(e)[:200]}")
 
     finally:
         elapsed = asyncio.get_event_loop().time() - started
