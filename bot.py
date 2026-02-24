@@ -53,7 +53,7 @@ class GeminiQuotaError(Exception):
 #   5 = G  RaceTime / Fastest-Lap-Zeit (Zeile 3)
 #   6 = H  +L
 
-COL_OFFSET_PER_RACE  = 16
+COL_OFFSET_PER_RACE  = 14
 ROW_OFFSET_PER_GRID  = 20
 FIRST_DATA_ROW       = 5
 FIRST_COL_RACE1      = 2
