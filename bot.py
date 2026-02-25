@@ -542,7 +542,6 @@ def build_race_embed(rennen):
             description="\n".join(lines),
             color=0x1a1a2e
         )
-        embed.set_footer(text=f"race={rennen:02d}")
         return embed
 
     except Exception as e:
@@ -551,31 +550,31 @@ def build_race_embed(rennen):
             description=f"**Race {rennen:02d}**",
             color=0x1a1a2e
         )
-        embed.set_footer(text=f"race={rennen:02d}")
         return embed
 
 def parse_race_number_from_embed(message):
-    """Liest Rennnummer aus Bot-Embed-Footer. Gibt None zurueck wenn kein Race-Embed."""
+    """Liest Rennnummer aus Bot-Embed-Description (**Race XX**). Gibt None zurueck wenn kein Race-Embed."""
     if not hasattr(discord_client, 'user') or discord_client.user is None:
         return None
     if message.author.id != discord_client.user.id:
         return None
     for embed in message.embeds:
-        if embed.footer and embed.footer.text:
-            m = re.search(r"^race=(\d+)$", embed.footer.text.strip())
-            if m:
+        # Race-Kasten hat Description die mit **Race XX** beginnt, kein grid/page im Text
+        if embed.description:
+            m = re.match(r"^\*\*Race (\d+)\*\*", embed.description.strip())
+            if m and embed.footer and embed.footer.text and "grid=" not in embed.footer.text:
                 return int(m.group(1))
     return None
 
 def parse_screenshot_meta_from_embed(message):
-    """Liest race/grid/page aus Screenshot-Bot-Post-Footer."""
+    """Liest race/grid/page aus Screenshot-Description: 'Race 03 · Grid 2a · Seite 1'"""
     if not hasattr(discord_client, 'user') or discord_client.user is None:
         return None
     if message.author.id != discord_client.user.id:
         return None
     for embed in message.embeds:
-        if embed.footer and embed.footer.text:
-            m = re.search(r"race=(\d+)\s+grid=(\S+)\s+page=(\d+)", embed.footer.text)
+        if embed.description:
+            m = re.match(r"Race (\d+)\s+\S+\s+Grid (\S+)\s+\S+\s+Seite (\d+)", embed.description.strip())
             if m:
                 return {
                     "race": int(m.group(1)),
@@ -654,7 +653,6 @@ async def cmd_sort(channel):
             grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
             title    = f"Race {meta['race']:02d} \u00b7 Grid {grid_str} \u00b7 Seite {meta['page']}"
             embed    = discord.Embed(description=title, color=0x2b2d31)
-            embed.set_footer(text=f"race={meta['race']:02d} grid={meta['grid']} page={meta['page']}")
             with open(tmp_path, "rb") as f:
                 await channel.send(
                     file=discord.File(f, filename="screenshot.png"),
@@ -738,7 +736,6 @@ async def process_image(message, attachment):
         grid_str = grid_label.upper() if grid_label.isdigit() else grid_label
         title    = f"Race {rennen:02d} \u00b7 Grid {grid_str} \u00b7 Seite {page}"
         embed    = discord.Embed(description=title, color=0x2b2d31)
-        embed.set_footer(text=f"race={rennen:02d} grid={grid_label} page={page}")
 
         with open(tmp_path, "rb") as f:
             await channel.send(
@@ -790,7 +787,6 @@ async def handle_command(message):
                 description=f"**Race {next_rn:02d}**",
                 color=0x1a1a2e
             )
-            embed.set_footer(text=f"race={next_rn:02d}")
             await channel.send(embed=embed)
             log.info(f"!next: Race-Kasten fuer Rennen {next_rn} erstellt.")
             await check_gemini_version(channel)
@@ -806,7 +802,6 @@ async def handle_command(message):
                 description=f"**Race {rn:02d}**",
                 color=0x1a1a2e
             )
-            embed.set_footer(text=f"race={rn:02d}")
             await channel.send(embed=embed)
             log.info(f"!race: Race-Kasten fuer Rennen {rn} erstellt.")
             await check_gemini_version(channel)
@@ -876,7 +871,6 @@ async def scan_channel():
     _, existing_rn = await find_last_race_box(channel)
     if existing_rn is None:
         embed = discord.Embed(description="**Race 01**", color=0x1a1a2e)
-        embed.set_footer(text="race=01")
         await channel.send(embed=embed)
         log.info("Erster Race-Kasten (Race 01) erstellt.")
         await check_gemini_version(channel)
