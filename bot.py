@@ -26,48 +26,55 @@ DISCORD_CHANNEL_ID     = int(os.environ["DISCORD_CHANNEL_ID"])
 GEMINI_API_KEY         = os.environ["GEMINI_API_KEY"]
 GOOGLE_SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS     = os.environ["GOOGLE_CREDENTIALS"]
-GEMINI_2ND_RUN         = int(os.environ.get("GEMINI_2ND_RUN", "0"))       # 0=off 1=bei Fehler 2=immer
+GEMINI_2ND_RUN         = int(os.environ.get("GEMINI_2ND_RUN", "0"))
 GEMINI_BACKOFF_MINUTES = int(os.environ.get("GEMINI_BACKOFF_MINUTES", "60"))
 
 POLL_INTERVAL = 15
 DONE_EMOJI    = "\u2705"
 ERROR_EMOJI   = "\u274c"
 
-# Zahlen-Emojis fuer Fortschrittsanzeige bei mehreren Bildern
 NUMBER_EMOJIS = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3",
                  "5\ufe0f\u20e3", "6\ufe0f\u20e3", "7\ufe0f\u20e3", "8\ufe0f\u20e3",
                  "9\ufe0f\u20e3", "\U0001f51f"]
 
-# Gemini-Quota-Sperre (in-memory, wird gesetzt wenn Kontingent erschoepft)
+# Gemini-Quota-Sperre
 gemini_blocked_until = None
+
+# In-memory Fahrzeugliste (wird beim Start und bei !update geladen)
+car_list = []
 
 class GeminiQuotaError(Exception):
     pass
 
 # ── Sheet-Layout ───────────────────────────────────────────────────────────────
-# Rennen 1 startet in Spalte B (Index 2), Abstand 16 Spalten pro Rennen
-# Zeilen pro Grid-Block: 20 (Block 0 = Zeilen 5-24, Block 1 = 25-44, usw.)
-# Fastest-Lap-Zeile: 3
+# Blatt "T":       Ergebnisse
+# Blatt "DB_Tech": Fahrzeugliste Spalte R ab Zeile 8
+# Blatt "DB_drvr": Fahrerliste Spalte C ab Zeile 5
 #
-# Relative Spalten innerhalb eines Rennblocks (0-basiert von Spalte B):
-#   0 = B  Grid-Label
-#   1 = C  Position
-#   2 = D  Driver
-#   3 = E  Team (nicht befuellt)
-#   4 = F  Car  / Fastest-Lap-Fahrer (Zeile 3)
-#   5 = G  RaceTime / Fastest-Lap-Zeit (Zeile 3)
-#   6 = H  +L
+# Rennen 1 startet in Spalte B (Index 2), Abstand 14 Spalten pro Rennen
+# Zeilen pro Grid-Block: 20
+# Fastest-Lap-Zeile: 3
+# Datum: D3, Track: E3, Drivers: B4 (zusammengefuehrt)
+#
+# REL (0-basiert von Rennen-Startspalte):
+#   0 = Grid-Label
+#   1 = Position
+#   2 = Driver
+#   4 = Car / FL-Fahrer (Zeile 3)
+#   5 = RaceTime / FL-Zeit (Zeile 3)
+#   6 = +L
 
-COL_OFFSET_PER_RACE  = 14
-ROW_OFFSET_PER_GRID  = 20
-FIRST_DATA_ROW       = 5
-FIRST_COL_RACE1      = 2
-FASTEST_LAP_ROW      = 3
+COL_OFFSET_PER_RACE = 14
+ROW_OFFSET_PER_GRID = 20
+FIRST_DATA_ROW      = 5
+FIRST_COL_RACE1     = 2
+FASTEST_LAP_ROW     = 3
 
 REL = {
     "grid_label": 0,
     "position":   1,
     "driver":     2,
+    "team":       3,
     "car":        4,
     "racetime":   5,
     "laps":       6,
@@ -90,62 +97,88 @@ def get_cell(rennen, block, position, field):
 def get_grid_label_cell(rennen, block):
     return row_start(block), col_start(rennen) + REL["grid_label"]
 
-# ── Google Sheets ─────────────────────────────────────────────────────────────
-def get_sheet():
+# ── Google Sheets Client ──────────────────────────────────────────────────────
+def get_gspread_client():
     creds_dict = json.loads(GOOGLE_CREDENTIALS)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-    return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+    return gspread.authorize(creds)
 
+def get_sheet():
+    """Gibt Tabellenblatt 'T' zurueck."""
+    return get_gspread_client().open_by_key(GOOGLE_SHEET_ID).worksheet("T")
+
+def get_workbook():
+    """Gibt die gesamte Arbeitsmappe zurueck."""
+    return get_gspread_client().open_by_key(GOOGLE_SHEET_ID)
+
+# ── Fahrzeug- und Fahrerliste laden ──────────────────────────────────────────
+def load_car_list():
+    """Laedt Fahrzeugliste aus DB_Tech, Spalte R ab Zeile 8."""
+    global car_list
+    try:
+        wb    = get_workbook()
+        sheet = wb.worksheet("DB_Tech")
+        vals  = sheet.col_values(18)  # Spalte R = 18
+        car_list = [v.strip() for v in vals[7:] if v.strip()]  # ab Zeile 8
+        log.info(f"Fahrzeugliste geladen: {len(car_list)} Eintraege")
+    except Exception as e:
+        log.error(f"Fehler beim Laden der Fahrzeugliste: {e}")
+        car_list = []
+
+def load_driver_list():
+    """Laedt Fahrerliste aus DB_drvr, Spalte C (Name) und K (Team) ab Zeile 5.
+    Gibt dict {lower_name: (original_name, team)} zurueck."""
+    try:
+        wb     = get_workbook()
+        sheet  = wb.worksheet("DB_drvr")
+        names  = sheet.col_values(3)   # Spalte C = 3
+        teams  = sheet.col_values(11)  # Spalte K = 11
+        result = {}
+        for i, name in enumerate(names[4:], start=0):  # ab Zeile 5
+            name = name.strip()
+            if not name:
+                continue
+            team = teams[4 + i].strip() if (4 + i) < len(teams) else ""
+            result[name.lower()] = (name, team)
+        log.info(f"Fahrerliste geladen: {len(result)} Eintraege")
+        return result
+    except Exception as e:
+        log.error(f"Fehler beim Laden der Fahrerliste: {e}")
+        return {}
+
+# ── Grid-Block Aufloesung ─────────────────────────────────────────────────────
 def read_grid_label(sheet, rennen, block):
     r, c = get_grid_label_cell(rennen, block)
-    val = sheet.cell(r, c).value
+    val  = sheet.cell(r, c).value
     return (val or "").strip().lower()
 
 def resolve_block(sheet, rennen, grid_label):
-    """
-    Ermittelt den Ziel-Block (0-basiert).
-    Ausgangspunkt ist immer 3-Grid-Annahme:
-      Block 0 -> Grid 1
-      Block 1 -> Grid 2 / 2a
-      Block 2 -> Grid 3  (oder 2b wenn 3 schon da ist)
-      Block 3 -> Grid 3  (wenn 2b in Block 2 eingetragen wurde)
-    """
     gl = grid_label.strip().lower()
-
     if gl == "1":
         return 0
     if gl in ("2", "2a"):
         return 1
-
     label_block2 = read_grid_label(sheet, rennen, 2)
-
     if gl == "3":
-        if label_block2 == "2b":
-            return 3
-        return 2
-
+        return 3 if label_block2 == "2b" else 2
     if gl == "2b":
         if label_block2 == "3":
             log.info(f"Rennen {rennen}: Grid 3 in Block 2, verschiebe nach Block 3")
             shift_block(sheet, rennen, src_block=2, dst_block=3)
         return 2
-
     log.warning(f"Unbekanntes Grid-Label '{grid_label}', verwende Block 2")
     return 2
 
 def shift_block(sheet, rennen, src_block, dst_block):
-    """Verschiebt alle Daten eines Blocks in einen anderen."""
     sr, sc = get_grid_label_cell(rennen, src_block)
     dr, dc = get_grid_label_cell(rennen, dst_block)
     sheet.update_cell(dr, dc, sheet.cell(sr, sc).value or "")
     sheet.update_cell(sr, sc, "")
     time.sleep(0.2)
-
     for pos in range(1, 21):
         for field in ("driver", "car", "racetime", "laps"):
             sr2, sc2 = get_cell(rennen, src_block, pos, field)
@@ -156,7 +189,7 @@ def shift_block(sheet, rennen, src_block, dst_block):
 
 # ── Zeit-Formatierung ─────────────────────────────────────────────────────────
 def clean_time(zeit):
-    """Gibt (racetime_digits, laps) zurueck."""
+    """Gibt (racetime_int_or_None, laps_int_or_None) zurueck. Zeiten als Integer (kein Apostroph)."""
     if not zeit:
         return None, None
     z = zeit.strip()
@@ -164,14 +197,13 @@ def clean_time(zeit):
         return None, None
     m = re.match(r"^(\d+)\s*(Runden?|Laps?)$", z, re.IGNORECASE)
     if m:
-        return None, m.group(1)
+        return None, int(m.group(1))
     digits = re.sub(r"[^\d]", "", z)
-    return (digits if digits else None), None
+    return (int(digits) if digits else None), None
 
 # ── Delta-Validierung ─────────────────────────────────────────────────────────
 def validate_deltas(fahrer_list):
-    """Gibt Positionen zurueck bei denen das Delta nicht groesser als das vorherige ist."""
-    errors = []
+    errors     = []
     prev_delta = None
     for f in sorted(fahrer_list, key=lambda x: x["position"]):
         pos = f["position"]
@@ -180,89 +212,84 @@ def validate_deltas(fahrer_list):
         racetime, laps = clean_time(f.get("zeit", ""))
         if racetime is None:
             continue
-        try:
-            delta = int(racetime)
-        except ValueError:
-            continue
-        if prev_delta is not None and delta <= prev_delta:
+        if prev_delta is not None and racetime <= prev_delta:
             errors.append(pos)
-            log.warning(f"Delta-Fehler P{pos}: {delta} <= {prev_delta}")
-        prev_delta = delta
+            log.warning(f"Delta-Fehler P{pos}: {racetime} <= {prev_delta}")
+        prev_delta = racetime
     return errors
 
-def mark_red(sheet, rennen, block, position):
-    r, c = get_cell(rennen, block, position, "racetime")
-    cell_addr = rowcol_to_a1(r, c)
-    sheet.format(cell_addr, {
-        "textFormat": {
-            "foregroundColor": {"red": 1.0, "green": 0.0, "blue": 0.0}
-        }
+def mark_cell_red(sheet, row, col):
+    sheet.format(rowcol_to_a1(row, col), {
+        "textFormat": {"foregroundColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}
     })
 
 # ── Schnellste Runde ──────────────────────────────────────────────────────────
 def update_fastest_lap(sheet, rennen, new_driver, new_time_int):
-    """Traegt schnellste Runde in Zeile 3 ein, wenn sie schneller als die aktuelle ist."""
-    c_driver = col_start(rennen) + REL["fl_driver"]
-    c_time   = col_start(rennen) + REL["fl_time"]
-
+    c_driver    = col_start(rennen) + REL["fl_driver"]
+    c_time      = col_start(rennen) + REL["fl_time"]
     current_val = sheet.cell(FASTEST_LAP_ROW, c_time).value
     if current_val:
         current_digits = re.sub(r"[^\d]", "", str(current_val))
         if current_digits and int(current_digits) <= new_time_int:
             return
-
     log.info(f"Neue schnellste Runde: {new_driver} - {new_time_int}")
     sheet.update_cell(FASTEST_LAP_ROW, c_driver, new_driver)
-    sheet.update_cell(FASTEST_LAP_ROW, c_time, str(new_time_int))
+    sheet.update_cell(FASTEST_LAP_ROW, c_time,   new_time_int)  # Integer, kein Apostroph
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+gemini_model      = genai.GenerativeModel(GEMINI_MODEL)
 GENERATION_CONFIG = genai.GenerationConfig(temperature=0)
 
-PROMPT_EXTRACT = (
-    "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
-    "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
-    "WICHTIG: Kopiere alle Texte (Fahrernamen, Autonamen) EXAKT so wie sie im Bild stehen.\n"
-    "Korrigiere NIEMALS Schreibweise, Gross-/Kleinschreibung, Sonderzeichen oder Tippfehler.\n"
-    "Fahrernamen sind Online-Nicknames und koennen ungewoehnliche Schreibweisen haben.\n"
-    "Beispiel: 'Bismark' bleibt 'Bismark', NICHT 'Bismarck'.\n"
-    "Beispiel: 'XxChillerHDxX95' bleibt exakt so, NICHT vereinfacht.\n\n"
-    "Format:\n"
-    "{\n"
-    '  "rennen": <Zahl>,\n'
-    '  "grid": "<Grid-Label als String: 1, 2, 2a, 2b oder 3>",\n'
-    '  "fahrer": [\n'
-    "    {\n"
-    '      "position": <Zahl>,\n'
-    '      "name": "<Fahrername exakt wie im Bild>",\n'
-    '      "auto": "<Autoname exakt wie im Bild>",\n'
-    '      "zeit": "<Zeitstring exakt wie im Bild>",\n'
-    '      "beste_runde": "<Rundenzeit aus Spalte BESTE RUNDE, z.B. 8:27,088, oder leer>"\n'
-    "    }\n"
-    "  ]\n"
-    "}\n\n"
-    "Hinweise:\n"
-    "- rennen und grid stehen im Titel, z.B. 'Rennen 16 - Grid 3' oder 'Grid 2a'\n"
-    "- grid ist immer ein String\n"
-    "- Der Erstplatzierte hat eine absolute Rennzeit (z.B. 50:28,752)\n"
-    "- Alle anderen haben ein Delta (z.B. +06,425 oder +1:13,995)\n"
-    "- Bei ueberrundeten Fahrern steht X Runden oder X Laps als Zeit\n"
-    "- Bei DNF steht DNF oder --:--,--- als Zeit\n"
-    "- beste_runde ist die Rundenzeit in der Spalte BESTE RUNDE ganz rechts\n"
-)
+def build_extract_prompt():
+    """Erstellt den Extraktions-Prompt mit aktueller Fahrzeugliste."""
+    car_list_str = "\n".join(f"- {c}" for c in car_list) if car_list else "(keine Liste verfuegbar)"
+    return (
+        "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
+        "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
+        "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
+        "Beispiel: 'Bismark' bleibt 'Bismark', 'XxChillerHDxX95' bleibt exakt so.\n\n"
+        "FAHRZEUGNAMEN: Nutze IMMER den passenden Namen aus dieser Liste:\n"
+        f"{car_list_str}\n\n"
+        "Matching-Regeln fuer Fahrzeuge:\n"
+        "- Nutze dein Wissen ueber Hersteller (z.B. Huracan = Lamborghini)\n"
+        "- Die Jahreszahl ('22, '15 etc.) MUSS exakt uebereinstimmen\n"
+        "- Pruefe die KOMPLETTE Liste, nicht nur den ersten Treffer\n"
+        "- Wenn kein passender Eintrag: Originalnamen behalten, 'auto_unbekannt': true\n\n"
+        "Format:\n"
+        "{\n"
+        '  "rennen": <Zahl>,\n'
+        '  "grid": "<1, 2, 2a, 2b oder 3>",\n'
+        '  "fahrer": [\n'
+        "    {\n"
+        '      "position": <Zahl>,\n'
+        '      "name": "<exakt wie im Bild>",\n'
+        '      "auto": "<Name aus Liste oder Original>",\n'
+        '      "auto_unbekannt": <true oder false>,\n'
+        '      "zeit": "<exakt wie im Bild>",\n'
+        '      "beste_runde": "<z.B. 8:27,088 oder leer>"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Hinweise:\n"
+        "- rennen und grid stehen im Titel\n"
+        "- Erstplatzierter hat absolute Rennzeit (z.B. 50:28,752)\n"
+        "- Alle anderen haben Delta (z.B. +06,425)\n"
+        "- Ueberrundete Fahrer: 'X Runden' oder 'X Laps'\n"
+        "- DNF: 'DNF' oder '--:--,---'\n"
+        "- beste_runde aus Spalte BESTE RUNDE ganz rechts\n"
+    )
 
 PROMPT_VERIFY_TEMPLATE = (
     "Ich habe aus diesem Gran Turismo Screenshot folgende Daten extrahiert:\n\n"
     "{extracted}\n\n"
-    "Vergleiche diese Daten sorgfaeltig mit dem Bild.\n"
-    "Gib das (ggf. korrigierte) JSON zurueck. Gib NUR gueltiges JSON zurueck, kein Markdown.\n\n"
+    "Vergleiche sorgfaeltig mit dem Bild und gib korrigiertes JSON zurueck.\n"
+    "Gib NUR gueltiges JSON zurueck, kein Markdown.\n\n"
     "Regeln:\n"
     "- Aendere NUR was eindeutig falsch ist\n"
-    "- Korrigiere NIEMALS Schreibweise von Fahrernamen oder Autonamen\n"
-    "- Alle Texte muessen EXAKT wie im Bild stehen\n"
-    "- Wenn alles korrekt ist, gib exakt dieselben Daten zurueck\n"
+    "- Fahrernamen NIEMALS korrigieren\n"
+    "- Wenn alles korrekt, exakt dieselben Daten zurueckgeben\n"
 )
 
 def call_gemini(img, prompt):
@@ -274,19 +301,18 @@ def call_gemini(img, prompt):
         )
         text = response.text.strip()
         text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+        text = re.sub(r"\s*```$",     "", text)
         return json.loads(text)
     except ResourceExhausted as e:
-        log.error(f"Gemini ResourceExhausted - Details: {str(e)}")
+        log.error(f"Gemini ResourceExhausted: {str(e)}")
         gemini_blocked_until = datetime.now() + timedelta(minutes=GEMINI_BACKOFF_MINUTES)
-        log.error(f"Gemini-Kontingent erschoepft. Sperre fuer {GEMINI_BACKOFF_MINUTES} Minuten.")
+        log.error(f"Gemini-Sperre fuer {GEMINI_BACKOFF_MINUTES} Minuten.")
         raise GeminiQuotaError("Gemini-Kontingent erschoepft") from e
     except Exception as e:
-        log.error(f"Gemini unerwarteter Fehler ({type(e).__name__}): {str(e)}")
+        log.error(f"Gemini Fehler ({type(e).__name__}): {str(e)}")
         raise
 
 def gemini_is_blocked():
-    """Prueft ob die Gemini-Sperre noch aktiv ist."""
     global gemini_blocked_until
     if gemini_blocked_until is None:
         return False
@@ -296,36 +322,62 @@ def gemini_is_blocked():
         return False
     return True
 
-def analyse_image(image_path):
-    img = Image.open(image_path)
+async def check_gemini_version(channel):
+    """Fragt Gemini ob die aktuelle Version noch empfehlenswert ist. Wird bei neuen Rennkaesten aufgerufen."""
 
-    data = call_gemini(img, PROMPT_EXTRACT)
+    prompt = (
+        f"Wir nutzen das Gemini-Modell '{GEMINI_MODEL}' ueber die Google AI API kostenlos (Free Tier) "
+        f"fuer Bildanalyse (Text und strukturierte Daten aus Screenshots lesen). "
+        f"Ist dieses Modell fuer diese Aufgabe noch empfehlenswert, oder gibt es ein neueres/besseres Modell, "
+        f"das ebenfalls kostenlos im Free Tier der Google AI API verfuegbar ist? "
+        f"Antworte auf Deutsch in einem kurzen Absatz. "
+        f"Falls das Modell noch gut geeignet ist, sag das kurz. "
+        f"Erklaere nicht, was das Modell allgemein kann."
+    )
+    try:
+        response = gemini_model.generate_content(prompt, generation_config=GENERATION_CONFIG)
+        text = response.text.strip()
+        log.info(f"Gemini-Versions-Check: {text}")
+
+        # Nur posten wenn eine neuere Version empfohlen wird
+        lower = text.lower()
+        if any(kw in lower for kw in ["neuere", "empfehle", "besser", "ersetzen", "wechseln", "aktueller"]):
+            embed = discord.Embed(
+                title="Gemini Versions-Hinweis",
+                description=text,
+                color=0xf0a500
+            )
+            await channel.send(embed=embed)
+            log.info("Gemini-Versions-Hinweis im Channel gepostet.")
+        else:
+            log.info("Gemini-Version ist noch aktuell, kein Hinweis noetig.")
+    except Exception as e:
+        log.warning(f"Gemini-Versions-Check fehlgeschlagen: {e}")
+
+def analyse_image(image_path):
+    img    = Image.open(image_path)
+    prompt = build_extract_prompt()
+    data   = call_gemini(img, prompt)
     log.info(f"Durchlauf 1: Rennen {data.get('rennen')}, Grid {data.get('grid')}, "
              f"{len(data.get('fahrer', []))} Fahrer")
 
     if GEMINI_2ND_RUN == 0:
         return data
 
-    run_second = False
-    if GEMINI_2ND_RUN == 2:
-        run_second = True
-    elif GEMINI_2ND_RUN == 1:
-        errors = validate_deltas(data.get("fahrer", []))
-        run_second = len(errors) > 0
+    run_second = GEMINI_2ND_RUN == 2
+    if GEMINI_2ND_RUN == 1:
+        run_second = len(validate_deltas(data.get("fahrer", []))) > 0
 
     if run_second:
         log.info("Starte Durchlauf 2 (Verifikation)...")
-        verify_prompt = PROMPT_VERIFY_TEMPLATE.format(
+        data2 = call_gemini(img, PROMPT_VERIFY_TEMPLATE.format(
             extracted=json.dumps(data, ensure_ascii=False, indent=2)
-        )
-        data2 = call_gemini(img, verify_prompt)
-
+        ))
         for f1, f2 in zip(data.get("fahrer", []), data2.get("fahrer", [])):
             for key in ("name", "auto", "zeit", "beste_runde"):
                 if f1.get(key) != f2.get(key):
                     log.warning(f"  Abweichung P{f1['position']} [{key}]: "
                                 f"'{f1.get(key)}' -> '{f2.get(key)}'")
-
         log.info("Durchlauf 2 abgeschlossen")
         data = data2
 
@@ -335,47 +387,82 @@ def analyse_image(image_path):
 def write_results(sheet, data):
     """
     Schreibt Ergebnisse ins Sheet via Batch-Update.
-    Gibt Liste von Discord-Warnmeldungen zurueck.
+    Gibt (warnings, rennen, grid_label, first_pos) zurueck.
     """
     rennen      = int(data["rennen"])
     grid_label  = str(data["grid"]).strip()
     fahrer_list = data["fahrer"]
     warnings    = []
 
+    driver_map = load_driver_list()
+
     block = resolve_block(sheet, rennen, grid_label)
     log.info(f"Rennen {rennen}, Grid '{grid_label}' -> Block {block}")
 
-    delta_errors = validate_deltas(fahrer_list)
-
+    delta_errors       = validate_deltas(fahrer_list)
     fastest_time_int   = None
     fastest_lap_driver = None
-
-    # Alle Zellwerte sammeln fuer Batch-Update
-    # Format: { "A1": value, "B2": value, ... }
-    batch = {}
+    batch              = {}
+    red_cells          = []
+    first_pos          = None
 
     # Grid-Label
     r, c = get_grid_label_cell(rennen, block)
     batch[rowcol_to_a1(r, c)] = grid_label
 
     for fahrer in sorted(fahrer_list, key=lambda x: x["position"]):
-        pos         = int(fahrer["position"])
-        name        = fahrer["name"]
-        auto        = fahrer["auto"]
-        zeit        = fahrer.get("zeit", "")
-        beste_runde = fahrer.get("beste_runde", "")
+        pos            = int(fahrer["position"])
+        name_raw       = fahrer["name"]
+        auto           = fahrer["auto"]
+        auto_unbekannt = fahrer.get("auto_unbekannt", False)
+        zeit           = fahrer.get("zeit", "")
+        beste_runde    = fahrer.get("beste_runde", "")
+
+        if first_pos is None:
+            first_pos = pos
+
+        # Fahrername und Team aus Fahrerliste (case-insensitive)
+        name_key = name_raw.lower()
+        if name_key in driver_map:
+            name, team = driver_map[name_key]
+        else:
+            name = name_raw
+            team = ""
+            r_drv, c_drv = get_cell(rennen, block, pos, "driver")
+            red_cells.append((r_drv, c_drv))
+            warnings.append(
+                f"Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name_raw}: "
+                f"Fahrer nicht in Fahrerliste"
+            )
 
         racetime, laps = clean_time(zeit)
 
         log.info(f"  P{pos} {name} | {auto} | racetime={racetime} "
                  f"laps={laps} fl={beste_runde}")
 
-        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "driver"))]   = name
-        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "car"))]      = auto
-        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "racetime"))] = racetime or ""
-        batch[rowcol_to_a1(*get_cell(rennen, block, pos, "laps"))]     = laps or ""
+        r_ps,  c_ps  = get_cell(rennen, block, pos, "position")
+        r_drv, c_drv = get_cell(rennen, block, pos, "driver")
+        r_tm,  c_tm  = get_cell(rennen, block, pos, "team")
+        r_car, c_car = get_cell(rennen, block, pos, "car")
+        r_rt,  c_rt  = get_cell(rennen, block, pos, "racetime")
+        r_lp,  c_lp  = get_cell(rennen, block, pos, "laps")
+
+        batch[rowcol_to_a1(r_ps,  c_ps)]  = pos
+        batch[rowcol_to_a1(r_drv, c_drv)] = name
+        batch[rowcol_to_a1(r_tm,  c_tm)]  = team
+        batch[rowcol_to_a1(r_car, c_car)] = auto
+        batch[rowcol_to_a1(r_rt,  c_rt)]  = racetime if racetime is not None else ""
+        batch[rowcol_to_a1(r_lp,  c_lp)]  = laps     if laps     is not None else ""
+
+        if auto_unbekannt:
+            red_cells.append((r_car, c_car))
+            warnings.append(
+                f"Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name}: "
+                f"Auto '{auto}' nicht erkannt - bitte manuell pruefen"
+            )
 
         if pos in delta_errors:
+            red_cells.append((r_rt, c_rt))
             warnings.append(
                 f"Grid {grid_label}, Pos {pos}, {name}: Zeit ist zu pruefen"
             )
@@ -393,33 +480,202 @@ def write_results(sheet, data):
                     fastest_time_int   = br_int
                     fastest_lap_driver = name
 
-    # Einen einzigen Batch-Update an die Sheets API
     sheet.batch_update([
         {"range": addr, "values": [[val]]}
         for addr, val in batch.items()
     ])
     log.info(f"Batch-Update: {len(batch)} Zellen geschrieben")
 
-    # Rote Markierung fuer Delta-Fehler (muss separat, da Formatierung kein Wert-Update ist)
-    for pos in delta_errors:
-        mark_red(sheet, rennen, block, pos)
+    for (row, col) in red_cells:
+        mark_cell_red(sheet, row, col)
 
-    # Schnellste Runde aktualisieren
     if fastest_lap_driver and fastest_time_int is not None:
         update_fastest_lap(sheet, rennen, fastest_lap_driver, fastest_time_int)
 
-    return warnings
+    return warnings, rennen, grid_label, first_pos
 
-# ── Discord Bot ───────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
-intents.reactions = True
+# ── Race-Kasten (Embed) ───────────────────────────────────────────────────────
+NA_PHRASES = {"strecke in db_tech definieren!", "n/a", ""}
 
-discord_client = discord.Client(intents=intents)
+def build_race_embed(rennen):
+    """Liest Daten aus Sheet und baut Discord-Embed fuer Rennkasten."""
+    try:
+        sheet = get_sheet()
+        cs    = col_start(rennen)
 
+        date_raw  = (sheet.cell(3, cs + 3).value or "").strip()  # D3
+        track_raw = (sheet.cell(3, cs + 4).value or "").strip()  # E3
+        drv_raw   = (sheet.cell(4, cs).value     or "").strip()  # B4
+
+        date_str  = "n/a" if date_raw.lower()  in NA_PHRASES else date_raw
+        track_str = "n/a" if track_raw.lower() in NA_PHRASES else track_raw
+
+        lines = [f"**Race {rennen:02d}**"]
+        if date_str:
+            lines.append(date_str)
+        if track_str:
+            lines.append(f"**{track_str}**")
+        if drv_raw:
+            lines.append(f"Drivers: {drv_raw}")
+
+        # Sieger je Grid-Block
+        winners = []
+        for block in range(4):
+            gl_r, gl_c = get_grid_label_cell(rennen, block)
+            gl_val     = (sheet.cell(gl_r, gl_c).value or "").strip()
+            if not gl_val:
+                continue
+            win_r, win_c = get_cell(rennen, block, 1, "driver")
+            win_name     = (sheet.cell(win_r, win_c).value or "").strip()
+            if win_name:
+                winners.append(f"Grid {gl_val}: {win_name}")
+
+        if winners:
+            lines.append("WINNERS")
+            lines.extend(winners)
+
+        # Schnellste Runde
+        fl_drv = (sheet.cell(FASTEST_LAP_ROW, cs + REL["fl_driver"]).value or "").strip()
+        fl_tim = (sheet.cell(FASTEST_LAP_ROW, cs + REL["fl_time"]).value   or "").strip()
+        if fl_drv:
+            lines.append(f"FL: {fl_drv} {fl_tim}")
+
+        embed = discord.Embed(
+            description="\n".join(lines),
+            color=0x1a1a2e
+        )
+        embed.set_footer(text=f"race={rennen:02d}")
+        return embed
+
+    except Exception as e:
+        log.error(f"Fehler beim Erstellen des Race-Embeds fuer Rennen {rennen}: {e}")
+        embed = discord.Embed(
+            description=f"**Race {rennen:02d}**",
+            color=0x1a1a2e
+        )
+        embed.set_footer(text=f"race={rennen:02d}")
+        return embed
+
+def parse_race_number_from_embed(message):
+    """Liest Rennnummer aus Bot-Embed-Footer. Gibt None zurueck wenn kein Race-Embed."""
+    if not hasattr(discord_client, 'user') or discord_client.user is None:
+        return None
+    if message.author.id != discord_client.user.id:
+        return None
+    for embed in message.embeds:
+        if embed.footer and embed.footer.text:
+            m = re.search(r"^race=(\d+)$", embed.footer.text.strip())
+            if m:
+                return int(m.group(1))
+    return None
+
+def parse_screenshot_meta_from_embed(message):
+    """Liest race/grid/page aus Screenshot-Bot-Post-Footer."""
+    if not hasattr(discord_client, 'user') or discord_client.user is None:
+        return None
+    if message.author.id != discord_client.user.id:
+        return None
+    for embed in message.embeds:
+        if embed.footer and embed.footer.text:
+            m = re.search(r"race=(\d+)\s+grid=(\S+)\s+page=(\d+)", embed.footer.text)
+            if m:
+                return {
+                    "race": int(m.group(1)),
+                    "grid": m.group(2),
+                    "page": int(m.group(3)),
+                }
+    return None
+
+GRID_ORDER = {"1": 0, "2": 1, "2a": 1, "2b": 2, "3": 3}
+
+def screenshot_sort_key(meta):
+    if meta is None:
+        return (999, 999, 999)
+    grid_idx = GRID_ORDER.get(meta["grid"].lower(), 99)
+    return (meta["race"], grid_idx, meta["page"])
+
+# ── Discord Hilfsfunktionen ───────────────────────────────────────────────────
+async def find_last_race_box(channel):
+    """Findet die letzte Race-Kasten-Nachricht. Gibt (message, rennen) zurueck."""
+    async for msg in channel.history(limit=200):
+        rn = parse_race_number_from_embed(msg)
+        if rn is not None:
+            return msg, rn
+    return None, None
+
+async def find_race_box(channel, rennen):
+    """Findet Race-Kasten fuer ein bestimmtes Rennen."""
+    async for msg in channel.history(limit=200):
+        rn = parse_race_number_from_embed(msg)
+        if rn == rennen:
+            return msg
+    return None
+
+async def update_race_box(channel, rennen):
+    """Aktualisiert Race-Kasten (oder erstellt neuen falls nicht vorhanden)."""
+    embed    = build_race_embed(rennen)
+    existing = await find_race_box(channel, rennen)
+    if existing:
+        await existing.edit(embed=embed)
+        log.info(f"Race-Kasten Rennen {rennen} aktualisiert.")
+    else:
+        await channel.send(embed=embed)
+        log.info(f"Race-Kasten Rennen {rennen} erstellt.")
+
+# ── !sort ─────────────────────────────────────────────────────────────────────
+async def cmd_sort(channel):
+    """Sortiert Bot-Screenshot-Posts nach Race/Grid/Seite seit dem letzten Rennkasten."""
+    last_box_msg, _ = await find_last_race_box(channel)
+
+    screenshots = []
+    async for msg in channel.history(limit=200, after=last_box_msg):
+        if msg.author.id != discord_client.user.id:
+            continue
+        meta = parse_screenshot_meta_from_embed(msg)
+        if meta is None:
+            continue
+        imgs = [a for a in msg.attachments
+                if a.content_type and a.content_type.startswith("image/")]
+        if not imgs:
+            continue
+        screenshots.append((msg, meta, imgs[0]))
+
+    if not screenshots:
+        log.info("!sort: Keine Bot-Screenshots gefunden.")
+        return
+
+    screenshots.sort(key=lambda x: screenshot_sort_key(x[1]))
+
+    for msg, meta, img_att in screenshots:
+        img_data = requests.get(img_att.url).content
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+            grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
+            title    = f"Race {meta['race']:02d} \u00b7 Grid {grid_str} \u00b7 Seite {meta['page']}"
+            embed    = discord.Embed(description=title, color=0x2b2d31)
+            embed.set_footer(text=f"race={meta['race']:02d} grid={meta['grid']} page={meta['page']}")
+            with open(tmp_path, "rb") as f:
+                await channel.send(
+                    file=discord.File(f, filename="screenshot.png"),
+                    embed=embed
+                )
+            await msg.delete()
+        finally:
+            os.unlink(tmp_path)
+        await asyncio.sleep(1)
+
+    log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
+
+# ── Reaktions-Hilfsfunktionen ─────────────────────────────────────────────────
 async def already_processed(message):
-    """Prueft ob alle Bilder der Nachricht verarbeitet wurden (gruener Haken oder X vom Bot)."""
-    for reaction in message.reactions:
+    try:
+        fresh = await message.channel.fetch_message(message.id)
+    except Exception:
+        return True
+    for reaction in fresh.reactions:
         if str(reaction.emoji) in (DONE_EMOJI, ERROR_EMOJI):
             async for user in reaction.users():
                 if user.id == discord_client.user.id:
@@ -427,8 +683,6 @@ async def already_processed(message):
     return False
 
 async def get_processed_count(message):
-    """Gibt zurueck wie viele Bilder bereits verarbeitet wurden (anhand Zahlen-Emojis vom Bot)."""
-    # Nachricht neu laden damit Reaktionen aktuell sind
     fresh = await message.channel.fetch_message(message.id)
     for reaction in fresh.reactions:
         emoji_str = str(reaction.emoji)
@@ -439,9 +693,7 @@ async def get_processed_count(message):
     return 0
 
 async def remove_number_reactions(message):
-    """Entfernt alle Zahlen-Emojis des Bots von einer Nachricht."""
-    # Kopie der Reaktionsliste damit wir waehrend Iteration entfernen koennen
-    fresh = await message.channel.fetch_message(message.id)
+    fresh     = await message.channel.fetch_message(message.id)
     to_remove = []
     for reaction in fresh.reactions:
         if str(reaction.emoji) in NUMBER_EMOJIS:
@@ -454,46 +706,66 @@ async def remove_number_reactions(message):
         except Exception as e:
             log.warning(f"Konnte Reaktion {emoji} nicht entfernen: {e}")
 
+# ── Screenshot verarbeiten und reposten ──────────────────────────────────────
 async def process_image(message, attachment):
     """
-    Verarbeitet ein einzelnes Bild. Gibt (elapsed, success) zurueck.
-    success=None bedeutet Quota-Fehler (kein Emoji setzen).
+    Verarbeitet ein Bild, postet es als Bot-Post und aktualisiert den Race-Kasten.
+    Gibt (elapsed, success) zurueck.
     """
     log.info(f"Verarbeite: {attachment.filename} von {message.author}")
     channel = message.channel
     started = asyncio.get_event_loop().time()
+    success = False
+    elapsed = 0
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp_path = f.name
 
-    success = False
     try:
         img_data = requests.get(attachment.url).content
         with open(tmp_path, "wb") as f:
             f.write(img_data)
 
-        data     = analyse_image(tmp_path)
-        sheet    = get_sheet()
-        warnings = write_results(sheet, data)
+        data  = analyse_image(tmp_path)
+        sheet = get_sheet()
+        warnings, rennen, grid_label, first_pos = write_results(sheet, data)
+
+        # Seite bestimmen: P1 = Seite 1, sonst Seite 2
+        page = 1 if (first_pos is None or first_pos == 1) else 2
 
         for w in warnings:
             await channel.send(w)
 
+        # Screenshot als Bot-Post mit lesbarem Embed
+        grid_str = grid_label.upper() if grid_label.isdigit() else grid_label
+        title    = f"Race {rennen:02d} \u00b7 Grid {grid_str} \u00b7 Seite {page}"
+        embed    = discord.Embed(description=title, color=0x2b2d31)
+        embed.set_footer(text=f"race={rennen:02d} grid={grid_label} page={page}")
+
+        with open(tmp_path, "rb") as f:
+            await channel.send(
+                file=discord.File(f, filename="screenshot.png"),
+                embed=embed
+            )
+
+        # Race-Kasten aktualisieren
+        await update_race_box(channel, rennen)
+
         elapsed = asyncio.get_event_loop().time() - started
-        log.info(f"Erfolgreich verarbeitet in {elapsed:.1f}s. {len(warnings)} Warnung(en).")
+        log.info(f"Verarbeitet in {elapsed:.1f}s. {len(warnings)} Warnung(en).")
         success = True
 
     except GeminiQuotaError:
         await channel.send(
-            f"Gemini-Tageskontingent erschoepft. Auswertung pausiert fuer ca. {GEMINI_BACKOFF_MINUTES} Minuten. "
-            f"Bild wird dann automatisch verarbeitet."
+            f"Gemini-Tageskontingent erschoepft. Auswertung pausiert fuer ca. "
+            f"{GEMINI_BACKOFF_MINUTES} Minuten. Bild wird automatisch verarbeitet."
         )
-        log.warning("Verarbeitung wegen Quota-Fehler abgebrochen, kein Emoji gesetzt.")
-        success = None   # Kein Emoji – spaeter nochmal versuchen
+        log.warning("Quota-Fehler, kein Emoji gesetzt.")
+        success = None
 
     except Exception as e:
         log.error(f"Fehler: {e}", exc_info=True)
-        await channel.send(f"Fehler bei der Verarbeitung: {type(e).__name__}: {str(e)[:200]}")
+        await channel.send(f"Fehler: {type(e).__name__}: {str(e)[:200]}")
         success = False
 
     finally:
@@ -501,6 +773,96 @@ async def process_image(message, attachment):
         os.unlink(tmp_path)
 
     return elapsed, success
+
+# ── Befehls-Handler ───────────────────────────────────────────────────────────
+async def handle_command(message):
+    """Verarbeitet Bot-Befehle. Loescht den User-Post danach."""
+    channel = message.channel
+    content = message.content.strip()
+    parts   = content.split()
+    cmd     = parts[0].lower()
+
+    try:
+        if cmd == "!next":
+            _, last_rn = await find_last_race_box(channel)
+            next_rn    = (last_rn + 1) if last_rn else 1
+            if next_rn > 1:
+                await cmd_sort(channel)
+            embed = discord.Embed(
+                description=f"**Race {next_rn:02d}**",
+                color=0x1a1a2e
+            )
+            embed.set_footer(text=f"race={next_rn:02d}")
+            await channel.send(embed=embed)
+            log.info(f"!next: Race-Kasten fuer Rennen {next_rn} erstellt.")
+            await check_gemini_version(channel)
+
+        elif cmd == "!race":
+            if len(parts) < 2:
+                await channel.send("Verwendung: !race <Nummer>")
+                return
+            rn = int(parts[1])
+            if rn > 1:
+                await cmd_sort(channel)
+            embed = discord.Embed(
+                description=f"**Race {rn:02d}**",
+                color=0x1a1a2e
+            )
+            embed.set_footer(text=f"race={rn:02d}")
+            await channel.send(embed=embed)
+            log.info(f"!race: Race-Kasten fuer Rennen {rn} erstellt.")
+            await check_gemini_version(channel)
+
+        elif cmd == "!update":
+            load_car_list()
+            if len(parts) >= 2:
+                rn = int(parts[1])
+                await update_race_box(channel, rn)
+                await channel.send(
+                    f"Fahrzeugliste aktualisiert. Race-Kasten {rn:02d} aktualisiert.",
+                    delete_after=10
+                )
+            else:
+                await channel.send("Fahrzeugliste aktualisiert.", delete_after=10)
+
+        elif cmd == "!sort":
+            await cmd_sort(channel)
+            await channel.send("Screenshots sortiert.", delete_after=5)
+
+        elif cmd == "!clean":
+            deleted = 0
+            async for msg in channel.history(limit=200):
+                if msg.author.id != discord_client.user.id:
+                    continue
+                has_embed = len(msg.embeds) > 0
+                has_image = any(
+                    a.content_type and a.content_type.startswith("image/")
+                    for a in msg.attachments
+                )
+                if not has_embed and not has_image:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.5)
+            log.info(f"!clean: {deleted} Nachrichten geloescht.")
+
+        else:
+            return
+
+    except Exception as e:
+        log.error(f"Fehler bei Befehl '{cmd}': {e}", exc_info=True)
+        await channel.send(f"Fehler bei {cmd}: {str(e)[:200]}")
+    finally:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+# ── Discord Bot ───────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions       = True
+
+discord_client = discord.Client(intents=intents)
 
 async def scan_channel():
     await discord_client.wait_until_ready()
@@ -512,64 +874,82 @@ async def scan_channel():
 
     log.info(f"Scanne #{channel.name} alle {POLL_INTERVAL}s | GEMINI_2ND_RUN={GEMINI_2ND_RUN}")
 
+    # Beim Start: Race 01 erstellen falls noch kein Rennkasten vorhanden
+    _, existing_rn = await find_last_race_box(channel)
+    if existing_rn is None:
+        embed = discord.Embed(description="**Race 01**", color=0x1a1a2e)
+        embed.set_footer(text="race=01")
+        await channel.send(embed=embed)
+        log.info("Erster Race-Kasten (Race 01) erstellt.")
+        await check_gemini_version(channel)
+
     while not discord_client.is_closed():
         try:
-            # Wenn Gemini gesperrt ist, Scan komplett ueberspringen
             if gemini_is_blocked():
-                log.info(f"Gemini gesperrt, ueberspringe Scan. Noch ca. {int((gemini_blocked_until - datetime.now()).total_seconds() / 60)} Minuten.")
+                mins = int((gemini_blocked_until - datetime.now()).total_seconds() / 60)
+                log.info(f"Gemini gesperrt, ueberspringe Scan. Noch ca. {mins} Minuten.")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
             async for message in channel.history(limit=50):
+
+                # Befehle verarbeiten (nur von Nicht-Bot-Usern)
+                if (message.content.startswith("!")
+                        and message.author.id != discord_client.user.id):
+                    await handle_command(message)
+                    continue
+
+                # Nur fremde Posts mit Bildern auslesen
+                if message.author.id == discord_client.user.id:
+                    continue
+
                 attachments = [
                     a for a in message.attachments
                     if a.content_type and a.content_type.startswith("image/")
                 ]
                 if not attachments:
                     continue
-                # Vollstaendig verarbeitet (Haken oder X) -> ueberspringen
                 if await already_processed(message):
                     continue
 
-                # Wieviele Bilder wurden bereits verarbeitet?
-                processed_count = await get_processed_count(message)
-                total           = len(attachments)
+                try:
+                    processed_count = await get_processed_count(message)
+                except Exception as e:
+                    log.warning(f"Reaktionen nicht lesbar, ueberspringe: {e}")
+                    continue
 
-                # Naechstes noch nicht verarbeitetes Bild
+                total      = len(attachments)
                 next_index = processed_count
                 if next_index >= total:
-                    continue   # Alle verarbeitet aber noch kein Haken – Sicherheitsnetz
+                    continue
 
-                attachment = attachments[next_index]
+                attachment      = attachments[next_index]
                 elapsed, success = await process_image(message, attachment)
 
-                # Nach Quota-Fehler sofort Scan-Schleife verlassen
                 if gemini_is_blocked():
                     break
 
                 if success is True:
                     new_count = processed_count + 1
-                    # Altes Zahlen-Emoji entfernen
                     await remove_number_reactions(message)
-
                     if new_count >= total:
-                        # Alle Bilder verarbeitet -> gruener Haken
-                        await message.add_reaction(DONE_EMOJI)
-                        log.info(f"Alle {total} Bilder verarbeitet.")
+                        # Alle Bilder fertig: Original-Post loeschen
+                        try:
+                            await message.delete()
+                            log.info("Original-Post geloescht.")
+                        except Exception as e:
+                            log.warning(f"Konnte Original-Post nicht loeschen: {e}")
                     else:
-                        # Noch nicht alle -> Zahl setzen
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
                         log.info(f"Bild {new_count}/{total} verarbeitet.")
                 elif success is False:
-                    # Fehler -> X setzen
                     await remove_number_reactions(message)
                     await message.add_reaction(ERROR_EMOJI)
                 # success is None -> Quota, kein Emoji
 
-                # Mindestens POLL_INTERVAL Sekunden zwischen zwei Auswertungen
-                remaining = POLL_INTERVAL - (elapsed or 0)
+                remaining = POLL_INTERVAL - elapsed
                 if remaining > 0:
-                    log.info(f"Warte noch {remaining:.1f}s (Durchlauf dauerte {elapsed:.1f}s)")
+                    log.info(f"Warte {remaining:.1f}s")
                     await asyncio.sleep(remaining)
 
         except Exception as e:
@@ -581,10 +961,10 @@ async def scan_channel():
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot laeuft.")
+    return web.Response(text="OK")
 
 async def start_webserver():
-    app = web.Application()
+    app    = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -596,6 +976,7 @@ async def start_webserver():
 @discord_client.event
 async def on_ready():
     log.info(f"Eingeloggt als {discord_client.user}")
+    load_car_list()
     discord_client.loop.create_task(scan_channel())
 
 async def main():
