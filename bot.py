@@ -326,13 +326,11 @@ async def check_gemini_version(channel):
     """Fragt Gemini ob die aktuelle Version noch empfehlenswert ist. Wird bei neuen Rennkaesten aufgerufen."""
 
     prompt = (
-        f"Wir nutzen das Gemini-Modell '{GEMINI_MODEL}' ueber die Google AI API kostenlos (Free Tier) "
-        f"fuer Bildanalyse (Text und strukturierte Daten aus Screenshots lesen). "
-        f"Ist dieses Modell fuer diese Aufgabe noch empfehlenswert, oder gibt es ein neueres/besseres Modell, "
-        f"das ebenfalls kostenlos im Free Tier der Google AI API verfuegbar ist? "
-        f"Antworte auf Deutsch in einem kurzen Absatz. "
-        f"Falls das Modell noch gut geeignet ist, sag das kurz. "
-        f"Erklaere nicht, was das Modell allgemein kann."
+        f"Wie ist der aktuelle Deprecation-Status fuer {GEMINI_MODEL} und gibt es fuer das Auslesen "
+        f"von Screenshots bereits eine stabilere oder neuere Empfehlung? "
+        f"Ohne Begruendung, antworte nur mit einem der beiden Saetze: "
+        f"'Bleib bei der aktuellen Version.' oder "
+        f"'Pruefe, ob ein Update auf Version [Versionsname] sinnvoll ist.'"
     )
     try:
         response = gemini_model.generate_content(prompt, generation_config=GENERATION_CONFIG)
