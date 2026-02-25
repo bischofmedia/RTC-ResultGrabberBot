@@ -224,10 +224,19 @@ def validate_deltas(fahrer_list):
         prev_delta = racetime
     return errors
 
-def mark_cell_red(sheet, row, col):
+GREY2 = {"red": 0.8, "green": 0.8, "blue": 0.8}  # Hellgrau 2 in Google Sheets
+RED   = {"red": 1.0, "green": 0.0, "blue": 0.0}
+
+def format_cell(sheet, row, col, color):
     sheet.format(rowcol_to_a1(row, col), {
-        "textFormat": {"foregroundColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}
+        "textFormat": {"foregroundColor": color}
     })
+
+def mark_cell_red(sheet, row, col):
+    format_cell(sheet, row, col, RED)
+
+def mark_cell_grey(sheet, row, col):
+    format_cell(sheet, row, col, GREY2)
 
 # ── Schnellste Runde ──────────────────────────────────────────────────────────
 def update_fastest_lap(sheet, rennen, new_driver, new_time_int):
@@ -260,6 +269,7 @@ def build_extract_prompt():
         f"{car_list_str}\n\n"
         "Matching-Regeln fuer Fahrzeuge:\n"
         "- Nutze dein Wissen ueber Hersteller (z.B. Huracan = Lamborghini)\n"
+        "- Sonderzeichen im Spielnamen koennen in der Liste fehlen (z.B. 'GT by Citroën Race Car' = 'Citroen GT')\n"
         "- Die Jahreszahl ('22, '15 etc.) MUSS exakt uebereinstimmen\n"
         "- Pruefe die KOMPLETTE Liste, nicht nur den ersten Treffer\n"
         "- Wenn kein passender Eintrag: Originalnamen behalten, 'auto_unbekannt': true\n\n"
@@ -490,6 +500,19 @@ def write_results(sheet, data):
     ])
     log.info(f"Batch-Update: {len(batch)} Zellen geschrieben")
 
+    # Alle beschriebenen Zellen zuerst grau setzen, dann rote ueberschreiben
+    all_cells = set()
+    for fahrer in fahrer_list:
+        pos = int(fahrer["position"])
+        for field in ("position", "driver", "team", "car", "racetime", "laps"):
+            all_cells.add(get_cell(rennen, block, pos, field))
+    gl_r, gl_c = get_grid_label_cell(rennen, block)
+    all_cells.add((gl_r, gl_c))
+
+    for (row, col) in all_cells:
+        if (row, col) not in [(r, c) for r, c in red_cells]:
+            mark_cell_grey(sheet, row, col)
+
     for (row, col) in red_cells:
         mark_cell_red(sheet, row, col)
 
@@ -507,18 +530,21 @@ def build_race_embed(rennen):
         sheet = get_sheet()
         cs    = col_start(rennen)
 
-        date_raw  = (sheet.cell(3, cs + 3).value or "").strip()  # D3
-        track_raw = (sheet.cell(3, cs + 4).value or "").strip()  # E3
+        date_raw  = (sheet.cell(3, cs + 2).value or "").strip()  # D3
+        track_raw = (sheet.cell(3, cs + 3).value or "").strip()  # E3
         drv_raw   = (sheet.cell(4, cs).value     or "").strip()  # B4
 
         date_str  = "n/a" if date_raw.lower()  in NA_PHRASES else date_raw
         track_str = "n/a" if track_raw.lower() in NA_PHRASES else track_raw
 
-        lines = [f"**Race {rennen:02d}**"]
-        if date_str:
+        # Erste Zeile: Race XX - Track (fett)
+        if track_str and track_str != "n/a":
+            lines = [f"**Race {rennen:02d} - {track_str}**"]
+        else:
+            lines = [f"**Race {rennen:02d}**"]
+
+        if date_str and date_str != "n/a":
             lines.append(date_str)
-        if track_str:
-            lines.append(f"**{track_str}**")
         if drv_raw:
             lines.append(f"Drivers: {drv_raw}")
 
@@ -535,14 +561,14 @@ def build_race_embed(rennen):
                 winners.append(f"Grid {gl_val}: {win_name}")
 
         if winners:
-            lines.append("WINNERS")
+            lines.append("**Sieger der Grids 🏆**")
             lines.extend(winners)
 
-        # Schnellste Runde
+        # Schnellste Runde: erst Zeit, dann Name
         fl_drv = (sheet.cell(FASTEST_LAP_ROW, cs + REL["fl_driver"]).value or "").strip()
         fl_tim = (sheet.cell(FASTEST_LAP_ROW, cs + REL["fl_time"]).value   or "").strip()
         if fl_drv:
-            lines.append(f"FL: {fl_drv} {fl_tim}")
+            lines.append(f"FL: {fl_tim} - {fl_drv}")
 
         embed = discord.Embed(
             description="\n".join(lines),
@@ -626,8 +652,45 @@ async def update_race_box(channel, rennen):
         log.info(f"Race-Kasten Rennen {rennen} erstellt.")
 
 # ── !sort ─────────────────────────────────────────────────────────────────────
+async def repost_text_messages(channel):
+    """
+    Verschiebt alle Bot-Textnachrichten seit dem letzten Rennkasten ans Ende.
+    Behaelt Embeds (Racekästen, Grid-Embeds) und Bilder an Ort und Stelle.
+    """
+    last_box_msg, _ = await find_last_race_box(channel)
+
+    text_msgs = []
+    async for msg in channel.history(limit=200, after=last_box_msg):
+        if msg.author.id != discord_client.user.id:
+            continue
+        has_embed = len(msg.embeds) > 0
+        has_image = any(a.content_type and a.content_type.startswith("image/")
+                        for a in msg.attachments)
+        if not has_embed and not has_image and msg.content:
+            text_msgs.append((msg, msg.content))
+
+    if not text_msgs:
+        return
+
+    # Reihenfolge beibehalten (aelteste zuerst - history() liefert neueste zuerst)
+    text_msgs.reverse()
+
+    for msg, content_txt in text_msgs:
+        try:
+            await msg.delete()
+        except Exception as e:
+            log.warning(f"Konnte Textnachricht nicht loeschen: {e}")
+        await channel.send(content_txt)
+        await asyncio.sleep(0.3)
+
+    log.info(f"{len(text_msgs)} Textnachrichten ans Ende verschoben.")
+
+
 async def cmd_sort(channel):
-    """Sortiert Bot-Screenshot-Posts nach Race/Grid/Seite seit dem letzten Rennkasten."""
+    """
+    Sortiert Bot-Screenshot-Posts nach Grid/Seite seit dem letzten Rennkasten.
+    Pro Grid ein Embed vorab, dann alle Seiten als nackte Bilder.
+    """
     last_box_msg, _ = await find_last_race_box(channel)
 
     screenshots = []
@@ -649,25 +712,43 @@ async def cmd_sort(channel):
 
     screenshots.sort(key=lambda x: screenshot_sort_key(x[1]))
 
+    # Bilder herunterladen bevor wir loeschen
+    downloaded = []
     for msg, meta, img_att in screenshots:
         img_data = requests.get(img_att.url).content
+        downloaded.append((msg, meta, img_data))
+
+    # Alte Posts loeschen
+    for msg, meta, _ in downloaded:
+        try:
+            await msg.delete()
+        except Exception as e:
+            log.warning(f"Konnte Post nicht loeschen: {e}")
+        await asyncio.sleep(0.5)
+
+    # Neu posten: pro Grid-Wechsel ein Embed, dann Bilder
+    current_grid_key = None
+    for _, meta, img_data in downloaded:
+        grid_key = (meta["race"], meta["grid"].lower())
+        grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
+
+        if grid_key != current_grid_key:
+            current_grid_key = grid_key
+            title = f"Race {meta['race']:02d} \u00b7 Grid {grid_str}"
+            embed = discord.Embed(description=title, color=0x2b2d31)
+            await channel.send(embed=embed)
+            await asyncio.sleep(0.5)
+
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             tmp_path = f.name
         try:
             with open(tmp_path, "wb") as f:
                 f.write(img_data)
-            grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
-            title    = f"Race {meta['race']:02d} \u00b7 Grid {grid_str} \u00b7 Seite {meta['page']}"
-            embed    = discord.Embed(description=title, color=0x2b2d31)
             with open(tmp_path, "rb") as f:
-                await channel.send(
-                    file=discord.File(f, filename="screenshot.png"),
-                    embed=embed
-                )
-            await msg.delete()
+                await channel.send(file=discord.File(f, filename="screenshot.png"))
         finally:
             os.unlink(tmp_path)
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
     log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
 
@@ -728,9 +809,16 @@ async def process_image(message, attachment):
         with open(tmp_path, "wb") as f:
             f.write(img_data)
 
+        status_msg = await channel.send("Screenshot wird verarbeitet...")
+
         data  = analyse_image(tmp_path)
         sheet = get_sheet()
         warnings, rennen, grid_label, first_pos = write_results(sheet, data)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
         # Seite bestimmen: P1 = Seite 1, sonst Seite 2
         page = 1 if (first_pos is None or first_pos == 1) else 2
@@ -950,6 +1038,8 @@ async def scan_channel():
                             log.info("Original-Post geloescht.")
                         except Exception as e:
                             log.warning(f"Konnte Original-Post nicht loeschen: {e}")
+                        # Bot-Textnachrichten seit letztem Rennkasten ans Ende verschieben
+                        await repost_text_messages(channel)
                     else:
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
                         log.info(f"Bild {new_count}/{total} verarbeitet.")
