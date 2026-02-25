@@ -46,6 +46,9 @@ car_list = []
 class GeminiQuotaError(Exception):
     pass
 
+# Nachrichten-IDs die gerade verarbeitet werden (verhindert Doppel-Scan)
+processing_ids: set = set()
+
 # ── Sheet-Layout ───────────────────────────────────────────────────────────────
 # Blatt "T":       Ergebnisse
 # Blatt "DB_Tech": Fahrzeugliste Spalte R ab Zeile 8
@@ -561,6 +564,7 @@ def build_race_embed(rennen):
                 winners.append(f"Grid {gl_val}: {win_name}")
 
         if winners:
+            lines.append("")
             lines.append("**Sieger der Grids 🏆**")
             lines.extend(winners)
 
@@ -844,11 +848,14 @@ async def process_image(message, attachment):
                     log.warning(f"Konnte Duplikat nicht loeschen: {e}")
                 break
 
+        # Embed zuerst, dann Bild als separater Post (Discord rendert sonst Bild oben)
+        await channel.send(embed=embed)
+        img_msg = None
         with open(tmp_path, "rb") as f:
-            await channel.send(
-                file=discord.File(f, filename="screenshot.png"),
-                embed=embed
-            )
+            img_msg = await channel.send(file=discord.File(f, filename="screenshot.png"))
+        # Bild-Post-ID merken damit Scan-Loop ihn nicht als User-Post behandelt
+        if img_msg:
+            processing_ids.add(img_msg.id)
 
         # Race-Kasten aktualisieren
         await update_race_box(channel, rennen)
@@ -1000,6 +1007,8 @@ async def scan_channel():
 
                 # Nur fremde Posts mit Bildern auslesen
                 if message.author.id == discord_client.user.id:
+                    continue
+                if message.id in processing_ids:
                     continue
 
                 attachments = [
