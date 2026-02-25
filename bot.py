@@ -49,6 +49,49 @@ class GeminiQuotaError(Exception):
 # Nachrichten-IDs die gerade verarbeitet werden (verhindert Doppel-Scan)
 processing_ids: set = set()
 
+# Grid-Farb-Emojis und Seite-Emojis
+GRID_EMOJI = {
+    "1":  "🟡",  # 🟡 gelb
+    "2":  "🔵",  # 🔵 blau
+    "2a": "🔵",  # 🔵 blau
+    "2b": "🔴",  # 🔴 rot
+    "3":  "🟢",  # 🟢 gruen
+}
+PAGE_EMOJI = {
+    1: "🔼",  # 🔼 Seite 1
+    2: "🔽",  # 🔽 Seite 2
+}
+ALL_GRID_EMOJIS = set(GRID_EMOJI.values())
+ALL_PAGE_EMOJIS = set(PAGE_EMOJI.values())
+ALL_MARKER_EMOJIS = ALL_GRID_EMOJIS | ALL_PAGE_EMOJIS
+
+def get_marker_emojis(grid_label, page):
+    """Gibt (grid_emoji, page_emoji) fuer ein Grid/Seite-Paar zurueck."""
+    g = GRID_EMOJI.get(grid_label.lower(), "❓")  # ❓ wenn unbekannt
+    p = PAGE_EMOJI.get(page, "❓")
+    return g, p
+
+def parse_meta_from_reactions(reactions, bot_id):
+    """Liest Grid und Seite aus Reaktionen eines Bot-Bild-Posts.
+    Gibt {"grid": str, "page": int} oder None zurueck."""
+    found_grid = None
+    found_page = None
+    for reaction in reactions:
+        emoji_str = str(reaction.emoji)
+        # Synchron pruefen ob Bot reagiert hat - reactions.users() ist async,
+        # daher pruefen wir einfach ob reaction.me True ist
+        if not reaction.me:
+            continue
+        for gl, ge in GRID_EMOJI.items():
+            if emoji_str == ge and found_grid is None:
+                found_grid = gl
+        for pg, pe in PAGE_EMOJI.items():
+            if emoji_str == pe:
+                found_page = pg
+    if found_grid is not None and found_page is not None:
+        return {"grid": found_grid, "page": found_page}
+    return None
+
 # ── Sheet-Layout ───────────────────────────────────────────────────────────────
 # Blatt "T":       Ergebnisse
 # Blatt "DB_Tech": Fahrzeugliste Spalte R ab Zeile 8
@@ -230,16 +273,21 @@ def validate_deltas(fahrer_list):
 GREY2 = {"red": 0.8, "green": 0.8, "blue": 0.8}  # Hellgrau 2 in Google Sheets
 RED   = {"red": 1.0, "green": 0.0, "blue": 0.0}
 
-def format_cell(sheet, row, col, color):
-    sheet.format(rowcol_to_a1(row, col), {
-        "textFormat": {"foregroundColor": color}
-    })
-
-def mark_cell_red(sheet, row, col):
-    format_cell(sheet, row, col, RED)
-
-def mark_cell_grey(sheet, row, col):
-    format_cell(sheet, row, col, GREY2)
+def batch_format_cells(sheet, grey_cells, red_cells):
+    """Formatiert alle Zellen in einem einzigen API-Aufruf statt einzeln."""
+    formats = []
+    for (row, col) in grey_cells:
+        formats.append({
+            "range": rowcol_to_a1(row, col),
+            "format": {"textFormat": {"foregroundColor": GREY2}}
+        })
+    for (row, col) in red_cells:
+        formats.append({
+            "range": rowcol_to_a1(row, col),
+            "format": {"textFormat": {"foregroundColor": RED}}
+        })
+    if formats:
+        sheet.batch_format(formats)
 
 # ── Schnellste Runde ──────────────────────────────────────────────────────────
 def update_fastest_lap(sheet, rennen, new_driver, new_time_int):
@@ -503,7 +551,7 @@ def write_results(sheet, data):
     ])
     log.info(f"Batch-Update: {len(batch)} Zellen geschrieben")
 
-    # Alle beschriebenen Zellen zuerst grau setzen, dann rote ueberschreiben
+    # Alle beschriebenen Zellen grau, Fehler-Zellen rot – ein einziger API-Aufruf
     all_cells = set()
     for fahrer in fahrer_list:
         pos = int(fahrer["position"])
@@ -512,12 +560,9 @@ def write_results(sheet, data):
     gl_r, gl_c = get_grid_label_cell(rennen, block)
     all_cells.add((gl_r, gl_c))
 
-    for (row, col) in all_cells:
-        if (row, col) not in [(r, c) for r, c in red_cells]:
-            mark_cell_grey(sheet, row, col)
-
-    for (row, col) in red_cells:
-        mark_cell_red(sheet, row, col)
+    red_set  = set(red_cells)
+    grey_set = all_cells - red_set
+    batch_format_cells(sheet, grey_set, red_set)
 
     if fastest_lap_driver and fastest_time_int is not None:
         update_fastest_lap(sheet, rennen, fastest_lap_driver, fastest_time_int)
@@ -602,30 +647,27 @@ def parse_race_number_from_embed(message):
                 return int(m.group(1))
     return None
 
-def parse_screenshot_meta_from_embed(message):
-    """Liest race/grid/page aus Screenshot-Description: 'Race 03 · Grid 2a · Seite 1'"""
+def parse_screenshot_meta_from_msg(message):
+    """Liest Grid und Seite aus Reaktions-Emojis eines Bot-Bild-Posts.
+    Gibt {"grid": str, "page": int} oder None zurueck."""
     if not hasattr(discord_client, 'user') or discord_client.user is None:
         return None
     if message.author.id != discord_client.user.id:
         return None
-    for embed in message.embeds:
-        if embed.description:
-            m = re.match(r"Race (\d+)\s+\S+\s+Grid (\S+)\s+\S+\s+Seite (\d+)", embed.description.strip())
-            if m:
-                return {
-                    "race": int(m.group(1)),
-                    "grid": m.group(2),
-                    "page": int(m.group(3)),
-                }
-    return None
+    # Nur Posts mit Bild-Anhang
+    has_image = any(a.content_type and a.content_type.startswith("image/")
+                    for a in message.attachments)
+    if not has_image:
+        return None
+    return parse_meta_from_reactions(message.reactions, discord_client.user.id)
 
 GRID_ORDER = {"1": 0, "2": 1, "2a": 1, "2b": 2, "3": 3}
 
 def screenshot_sort_key(meta):
     if meta is None:
-        return (999, 999, 999)
+        return (999, 999)
     grid_idx = GRID_ORDER.get(meta["grid"].lower(), 99)
-    return (meta["race"], grid_idx, meta["page"])
+    return (grid_idx, meta["page"])
 
 # ── Discord Hilfsfunktionen ───────────────────────────────────────────────────
 async def find_last_race_box(channel):
@@ -656,62 +698,37 @@ async def update_race_box(channel, rennen):
         log.info(f"Race-Kasten Rennen {rennen} erstellt.")
 
 # ── !sort ─────────────────────────────────────────────────────────────────────
-async def repost_text_messages(channel):
-    """
-    Verschiebt alle Bot-Textnachrichten seit dem letzten Rennkasten ans Ende.
-    Behaelt Embeds (Racekästen, Grid-Embeds) und Bilder an Ort und Stelle.
-    """
-    last_box_msg, _ = await find_last_race_box(channel)
-
-    text_msgs = []
-    async for msg in channel.history(limit=200, after=last_box_msg):
-        if msg.author.id != discord_client.user.id:
-            continue
-        has_embed = len(msg.embeds) > 0
-        has_image = any(a.content_type and a.content_type.startswith("image/")
-                        for a in msg.attachments)
-        if not has_embed and not has_image and msg.content:
-            text_msgs.append((msg, msg.content))
-
-    if not text_msgs:
-        return
-
-    # Reihenfolge beibehalten (aelteste zuerst - history() liefert neueste zuerst)
-    text_msgs.reverse()
-
-    for msg, content_txt in text_msgs:
-        try:
-            await msg.delete()
-        except Exception as e:
-            log.warning(f"Konnte Textnachricht nicht loeschen: {e}")
-        await channel.send(content_txt)
-        await asyncio.sleep(0.3)
-
-    log.info(f"{len(text_msgs)} Textnachrichten ans Ende verschoben.")
-
-
 async def cmd_sort(channel):
     """
     Sortiert Bot-Screenshot-Posts nach Grid/Seite seit dem letzten Rennkasten.
-    Pro Grid ein Embed vorab, dann alle Seiten als nackte Bilder.
+    Liest Metadaten aus Reaktions-Emojis. Postet Bilder neu, dann Textnachrichten.
     """
     last_box_msg, _ = await find_last_race_box(channel)
 
+    # Alle Bot-Bild-Posts seit dem letzten Rennkasten sammeln
     screenshots = []
+    text_msgs   = []
     async for msg in channel.history(limit=200, after=last_box_msg):
         if msg.author.id != discord_client.user.id:
             continue
-        meta = parse_screenshot_meta_from_embed(msg)
-        if meta is None:
-            continue
-        imgs = [a for a in msg.attachments
-                if a.content_type and a.content_type.startswith("image/")]
-        if not imgs:
-            continue
-        screenshots.append((msg, meta, imgs[0]))
+        has_image = any(a.content_type and a.content_type.startswith("image/")
+                        for a in msg.attachments)
+        if has_image:
+            meta = parse_screenshot_meta_from_msg(msg)
+            if meta is None:
+                log.warning(f"Bot-Bild ohne Metadaten-Emojis, ueberspringe: {msg.id}")
+                continue
+            imgs = [a for a in msg.attachments
+                    if a.content_type and a.content_type.startswith("image/")]
+            screenshots.append((msg, meta, imgs[0]))
+        elif not msg.embeds and msg.content:
+            text_msgs.append((msg, msg.content))
 
     if not screenshots:
         log.info("!sort: Keine Bot-Screenshots gefunden.")
+        # Textnachrichten trotzdem ans Ende
+        if text_msgs:
+            await _repost_texts(channel, text_msgs)
         return
 
     screenshots.sort(key=lambda x: screenshot_sort_key(x[1]))
@@ -722,39 +739,56 @@ async def cmd_sort(channel):
         img_data = requests.get(img_att.url).content
         downloaded.append((msg, meta, img_data))
 
-    # Alte Posts loeschen
-    for msg, meta, _ in downloaded:
+    # Alle alten Bild-Posts und Textnachrichten loeschen
+    for msg, _, _ in downloaded:
         try:
             await msg.delete()
         except Exception as e:
-            log.warning(f"Konnte Post nicht loeschen: {e}")
-        await asyncio.sleep(0.5)
+            log.warning(f"Konnte Bild-Post nicht loeschen: {e}")
+        await asyncio.sleep(0.3)
+    for msg, _ in text_msgs:
+        try:
+            await msg.delete()
+        except Exception as e:
+            log.warning(f"Konnte Textnachricht nicht loeschen: {e}")
+        await asyncio.sleep(0.3)
 
-    # Neu posten: pro Grid-Wechsel ein Embed, dann Bilder
-    current_grid_key = None
+    # Bilder in sortierter Reihenfolge neu posten mit Emojis
     for _, meta, img_data in downloaded:
-        grid_key = (meta["race"], meta["grid"].lower())
-        grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
-
-        if grid_key != current_grid_key:
-            current_grid_key = grid_key
-            title = f"Race {meta['race']:02d} \u00b7 Grid {grid_str}"
-            embed = discord.Embed(description=title, color=0x2b2d31)
-            await channel.send(embed=embed)
-            await asyncio.sleep(0.5)
-
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             tmp_path = f.name
         try:
             with open(tmp_path, "wb") as f:
                 f.write(img_data)
             with open(tmp_path, "rb") as f:
-                await channel.send(file=discord.File(f, filename="screenshot.png"))
+                img_msg = await channel.send(file=discord.File(f, filename="screenshot.png"))
+            processing_ids.add(img_msg.id)
+            g_emoji, p_emoji = get_marker_emojis(meta["grid"], meta["page"])
+            await img_msg.add_reaction(g_emoji)
+            await img_msg.add_reaction(p_emoji)
         finally:
             os.unlink(tmp_path)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
+
+    # Textnachrichten ans Ende (alte Reihenfolge, aelteste zuerst)
+    text_msgs.reverse()
+    for _, content_txt in text_msgs:
+        await channel.send(content_txt)
+        await asyncio.sleep(0.3)
 
     log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
+
+
+async def _repost_texts(channel, text_msgs):
+    """Hilfsfunktion: Textnachrichten loeschen und ans Ende reposten."""
+    text_msgs.reverse()
+    for msg, content_txt in text_msgs:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await channel.send(content_txt)
+        await asyncio.sleep(0.3)
 
 # ── Reaktions-Hilfsfunktionen ─────────────────────────────────────────────────
 async def already_processed(message):
@@ -813,6 +847,7 @@ async def process_image(message, attachment):
         with open(tmp_path, "wb") as f:
             f.write(img_data)
 
+        processing_ids.add(message.id)  # Verhindert Doppel-Scan waehrend Verarbeitung
         status_msg = await channel.send("Screenshot wird verarbeitet...")
 
         data  = analyse_image(tmp_path)
@@ -830,32 +865,25 @@ async def process_image(message, attachment):
         for w in warnings:
             await channel.send(w)
 
-        # Screenshot als Bot-Post mit lesbarem Embed
-        grid_str = grid_label.upper() if grid_label.isdigit() else grid_label
-        title    = f"Race {rennen:02d} \u00b7 Grid {grid_str} \u00b7 Seite {page}"
-        embed    = discord.Embed(description=title, color=0x2b2d31)
-
-        # Duplikat-Check: existiert bereits ein Bot-Post mit gleichen Metadaten?
+        # Duplikat-Check: existiert bereits ein Bot-Post mit gleichen Emojis?
+        g_emoji, p_emoji = get_marker_emojis(grid_label, page)
         async for old_msg in channel.history(limit=100):
-            old_meta = parse_screenshot_meta_from_embed(old_msg)
-            if (old_meta and old_meta["race"] == rennen
-                    and old_meta["grid"] == grid_label
+            old_meta = parse_screenshot_meta_from_msg(old_msg)
+            if (old_meta and old_meta["grid"] == grid_label
                     and old_meta["page"] == page):
                 try:
                     await old_msg.delete()
-                    log.info(f"Duplikat-Post geloescht: Race {rennen}, Grid {grid_label}, Seite {page}")
+                    log.info(f"Duplikat geloescht: Grid {grid_label}, Seite {page}")
                 except Exception as e:
                     log.warning(f"Konnte Duplikat nicht loeschen: {e}")
                 break
 
-        # Embed zuerst, dann Bild als separater Post (Discord rendert sonst Bild oben)
-        await channel.send(embed=embed)
-        img_msg = None
+        # Bild posten, dann Emojis setzen
         with open(tmp_path, "rb") as f:
             img_msg = await channel.send(file=discord.File(f, filename="screenshot.png"))
-        # Bild-Post-ID merken damit Scan-Loop ihn nicht als User-Post behandelt
-        if img_msg:
-            processing_ids.add(img_msg.id)
+        processing_ids.add(img_msg.id)
+        await img_msg.add_reaction(g_emoji)
+        await img_msg.add_reaction(p_emoji)
 
         # Race-Kasten aktualisieren
         await update_race_box(channel, rennen)
@@ -881,6 +909,7 @@ async def process_image(message, attachment):
         elapsed = asyncio.get_event_loop().time() - started
         os.unlink(tmp_path)
 
+    processing_ids.discard(message.id)
     return elapsed, success
 
 # ── Befehls-Handler ───────────────────────────────────────────────────────────
@@ -1047,8 +1076,8 @@ async def scan_channel():
                             log.info("Original-Post geloescht.")
                         except Exception as e:
                             log.warning(f"Konnte Original-Post nicht loeschen: {e}")
-                        # Bot-Textnachrichten seit letztem Rennkasten ans Ende verschieben
-                        await repost_text_messages(channel)
+                        # Kanal sortieren nach fertigem Multipost
+                        await cmd_sort(channel)
                     else:
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
                         log.info(f"Bild {new_count}/{total} verarbeitet.")
