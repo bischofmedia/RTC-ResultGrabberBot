@@ -642,7 +642,7 @@ def parse_race_number_from_embed(message):
     for embed in message.embeds:
         if embed.description:
             # Race-Kasten: beginnt mit **Race XX**, kein · im Text (Screenshot-Posts haben ·)
-            m = re.match(r"^\*\*Race (\d+)\*\*", embed.description.strip())
+            m = re.match(r"^\*\*Race (\d+)", embed.description.strip())
             if m and "·" not in embed.description:
                 return int(m.group(1))
     return None
