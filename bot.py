@@ -659,10 +659,10 @@ async def cmd_sort(channel):
             grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
             title    = f"Race {meta['race']:02d} \u00b7 Grid {grid_str} \u00b7 Seite {meta['page']}"
             embed    = discord.Embed(description=title, color=0x2b2d31)
-            await channel.send(embed=embed)
             with open(tmp_path, "rb") as f:
                 await channel.send(
-                    file=discord.File(f, filename="screenshot.png")
+                    file=discord.File(f, filename="screenshot.png"),
+                    embed=embed
                 )
             await msg.delete()
         finally:
@@ -743,10 +743,23 @@ async def process_image(message, attachment):
         title    = f"Race {rennen:02d} \u00b7 Grid {grid_str} \u00b7 Seite {page}"
         embed    = discord.Embed(description=title, color=0x2b2d31)
 
-        await channel.send(embed=embed)
+        # Duplikat-Check: existiert bereits ein Bot-Post mit gleichen Metadaten?
+        async for old_msg in channel.history(limit=100):
+            old_meta = parse_screenshot_meta_from_embed(old_msg)
+            if (old_meta and old_meta["race"] == rennen
+                    and old_meta["grid"] == grid_label
+                    and old_meta["page"] == page):
+                try:
+                    await old_msg.delete()
+                    log.info(f"Duplikat-Post geloescht: Race {rennen}, Grid {grid_label}, Seite {page}")
+                except Exception as e:
+                    log.warning(f"Konnte Duplikat nicht loeschen: {e}")
+                break
+
         with open(tmp_path, "rb") as f:
             await channel.send(
-                file=discord.File(f, filename="screenshot.png")
+                file=discord.File(f, filename="screenshot.png"),
+                embed=embed
             )
 
         # Race-Kasten aktualisieren
