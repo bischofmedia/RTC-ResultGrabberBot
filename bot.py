@@ -122,11 +122,15 @@ def load_car_list():
     try:
         wb    = get_workbook()
         sheet = wb.worksheet("DB_Tech")
-        vals  = sheet.col_values(18)  # Spalte R = 18
-        car_list = [v.strip() for v in vals[7:] if v.strip()]  # ab Zeile 8
-        log.info(f"Fahrzeugliste geladen: {len(car_list)} Eintraege")
+        # Begrenzten Bereich lesen (R8:R300) statt gesamte Spalte
+        vals  = sheet.get("R8:R300")
+        car_list = [row[0].strip() for row in vals if row and row[0].strip()]
+        if not car_list:
+            log.warning("Fahrzeugliste ist leer! Bitte DB_Tech pruefen (Spalte R ab Zeile 8).")
+        else:
+            log.info(f"Fahrzeugliste geladen: {len(car_list)} Eintraege")
     except Exception as e:
-        log.error(f"Fehler beim Laden der Fahrzeugliste: {e}")
+        log.error(f"KRITISCH: Fahrzeugliste konnte nicht geladen werden: {e}")
         car_list = []
 
 def load_driver_list():
@@ -135,19 +139,21 @@ def load_driver_list():
     try:
         wb     = get_workbook()
         sheet  = wb.worksheet("DB_drvr")
-        names  = sheet.col_values(3)   # Spalte C = 3
-        teams  = sheet.col_values(11)  # Spalte K = 11
+        # Namen und Teams in einem Aufruf lesen
+        rows   = sheet.get("C5:K200")
         result = {}
-        for i, name in enumerate(names[4:], start=0):  # ab Zeile 5
-            name = name.strip()
-            if not name:
-                continue
-            team = teams[4 + i].strip() if (4 + i) < len(teams) else ""
-            result[name.lower()] = (name, team)
-        log.info(f"Fahrerliste geladen: {len(result)} Eintraege")
+        for row in rows:
+            name = row[0].strip() if len(row) > 0 else ""
+            team = row[8].strip() if len(row) > 8 else ""  # K ist Index 8 in C:K
+            if name:
+                result[name.lower()] = (name, team)
+        if not result:
+            log.warning("Fahrerliste ist leer! Bitte DB_drvr pruefen (Spalte C ab Zeile 5).")
+        else:
+            log.info(f"Fahrerliste geladen: {len(result)} Eintraege")
         return result
     except Exception as e:
-        log.error(f"Fehler beim Laden der Fahrerliste: {e}")
+        log.error(f"KRITISCH: Fahrerliste konnte nicht geladen werden: {e}")
         return {}
 
 # ── Grid-Block Aufloesung ─────────────────────────────────────────────────────
@@ -559,10 +565,10 @@ def parse_race_number_from_embed(message):
     if message.author.id != discord_client.user.id:
         return None
     for embed in message.embeds:
-        # Race-Kasten hat Description die mit **Race XX** beginnt, kein grid/page im Text
         if embed.description:
+            # Race-Kasten: beginnt mit **Race XX**, kein · im Text (Screenshot-Posts haben ·)
             m = re.match(r"^\*\*Race (\d+)\*\*", embed.description.strip())
-            if m and embed.footer and embed.footer.text and "grid=" not in embed.footer.text:
+            if m and "·" not in embed.description:
                 return int(m.group(1))
     return None
 
@@ -653,10 +659,10 @@ async def cmd_sort(channel):
             grid_str = meta["grid"].upper() if meta["grid"].isdigit() else meta["grid"]
             title    = f"Race {meta['race']:02d} \u00b7 Grid {grid_str} \u00b7 Seite {meta['page']}"
             embed    = discord.Embed(description=title, color=0x2b2d31)
+            await channel.send(embed=embed)
             with open(tmp_path, "rb") as f:
                 await channel.send(
-                    file=discord.File(f, filename="screenshot.png"),
-                    embed=embed
+                    file=discord.File(f, filename="screenshot.png")
                 )
             await msg.delete()
         finally:
@@ -737,10 +743,10 @@ async def process_image(message, attachment):
         title    = f"Race {rennen:02d} \u00b7 Grid {grid_str} \u00b7 Seite {page}"
         embed    = discord.Embed(description=title, color=0x2b2d31)
 
+        await channel.send(embed=embed)
         with open(tmp_path, "rb") as f:
             await channel.send(
-                file=discord.File(f, filename="screenshot.png"),
-                embed=embed
+                file=discord.File(f, filename="screenshot.png")
             )
 
         # Race-Kasten aktualisieren
@@ -969,6 +975,13 @@ async def start_webserver():
 async def on_ready():
     log.info(f"Eingeloggt als {discord_client.user}")
     load_car_list()
+    if not car_list:
+        channel = discord_client.get_channel(DISCORD_CHANNEL_ID)
+        if channel:
+            await channel.send(
+                "⚠️ Fahrzeugliste konnte nicht geladen werden (DB_Tech, Spalte R ab Zeile 8). "
+                "Fahrzeugnamen werden nicht uebersetzt. Bitte !update ausfuehren nach Pruefung."
+            )
     discord_client.loop.create_task(scan_channel())
 
 async def main():
