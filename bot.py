@@ -121,7 +121,7 @@ def load_car_list():
     global car_list
     try:
         wb    = get_workbook()
-        sheet = wb.worksheet("DB_Tech")
+        sheet = wb.worksheet("DB_tech")
         # Begrenzten Bereich lesen (R8:R300) statt gesamte Spalte
         vals  = sheet.get("R8:R300")
         car_list = [row[0].strip() for row in vals if row and row[0].strip()]
