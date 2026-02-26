@@ -429,8 +429,8 @@ def call_gemini(img, prompt):
             raise GeminiQuotaError("daily") from e
         else:
             # Minutenlimit: kurze Pause
-            gemini_blocked_until = datetime.now() + timedelta(minutes=1)
-            log.warning("Gemini Minutenlimit erreicht. Sperre fuer 1 Minute.")
+            gemini_blocked_until = datetime.now() + timedelta(minutes=5)
+            log.warning("Gemini Minutenlimit erreicht. Sperre fuer 5 Minuten.")
             raise GeminiQuotaError("rpm") from e
     except Exception as e:
         log.error(f"Gemini Fehler ({type(e).__name__}): {str(e)}")
@@ -445,6 +445,17 @@ def gemini_is_blocked():
         log.info("Gemini-Sperre aufgehoben.")
         return False
     return True
+
+def berlin_time_str(dt):
+    """Gibt Uhrzeit in Berliner Zeit als HH:MM zurueck."""
+    try:
+        import zoneinfo
+        berlin = zoneinfo.ZoneInfo("Europe/Berlin")
+        dt_berlin = dt.astimezone(berlin)
+    except Exception:
+        # Fallback: UTC+1/+2 je nach Jahreszeit
+        dt_berlin = dt + timedelta(hours=2)
+    return dt_berlin.strftime("%H:%M")
 
 async def clear_quota_msg(channel):
     """Loescht die Quota-Warnmeldung wenn Sperre aufgehoben."""
@@ -1174,19 +1185,28 @@ async def process_image(message, attachment):
             f.write(img_data)
 
         processing_ids.add(message.id)  # Verhindert Doppel-Scan waehrend Verarbeitung
-        # Status erst posten wenn kein Quota-Problem bekannt
+
+        # Eine persistente Statusnachricht: entweder neue posten
+        # oder bestehende Limit-Nachricht umschreiben
         status_msg = None
-        if not gemini_is_blocked():
-            status_msg = await channel.send("Screenshot wird verarbeitet...")
+        try:
+            if quota_msg:
+                await quota_msg.edit(content="Screenshot wird ausgelesen...")
+                status_msg = quota_msg
+                quota_msg  = None
+            else:
+                status_msg = await channel.send("Screenshot wird ausgelesen...")
+        except Exception:
+            try:
+                status_msg = await channel.send("Screenshot wird ausgelesen...")
+            except Exception:
+                pass
 
         try:
             data = analyse_image(tmp_path)
         except Exception:
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+            # status_msg wird im GeminiQuotaError-Block weiterverwendet,
+            # bei anderen Fehlern loeschen
             raise  # Weiterwerfen damit except-Bloecke greifen
 
         sheet = get_sheet()
@@ -1195,6 +1215,7 @@ async def process_image(message, attachment):
         if status_msg:
             try:
                 await status_msg.delete()
+                status_msg = None
             except Exception:
                 pass
 
@@ -1233,27 +1254,21 @@ async def process_image(message, attachment):
 
     except GeminiQuotaError as qe:
         global quota_msg
-        if gemini_blocked_until:
-            remaining = int((gemini_blocked_until - datetime.now()).total_seconds() / 60)
-            wait_str  = f"ca. {remaining} Minuten" if remaining > 1 else "ca. 1 Minute"
-        else:
-            wait_str = "kurze Zeit"
-        if str(qe) == "daily":
-            text = (f"⏳ Gemini Tageslimit erreicht. "
-                    f"Auswertung pausiert fuer {wait_str}. "
-                    f"Bild wird dann automatisch verarbeitet.")
-        else:
-            text = (f"⏳ Gemini Minutenlimit erreicht. "
-                    f"Auswertung pausiert fuer {wait_str}. "
-                    f"Bild wird automatisch verarbeitet.")
+        retry_time = berlin_time_str(gemini_blocked_until) if gemini_blocked_until else "?"
+        text = f"⏳ Gemini-Limit erreicht, versuche es wieder um {retry_time} Uhr."
+        # status_msg in Limit-Nachricht umwandeln statt neue zu posten
         try:
-            if quota_msg:
+            if status_msg:
+                await status_msg.edit(content=text)
+                quota_msg  = status_msg
+                status_msg = None
+            elif quota_msg:
                 await quota_msg.edit(content=text)
             else:
                 quota_msg = await channel.send(text)
         except Exception:
             quota_msg = await channel.send(text)
-        log.warning(f"Quota-Fehler ({qe}), kein Emoji gesetzt.")
+        log.warning(f"Quota-Fehler ({qe}), Retry um {retry_time} Uhr.")
         success = None
 
     except Exception as e:
