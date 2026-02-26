@@ -945,15 +945,16 @@ async def cmd_check(channel):
             color = (cell.get("effectiveFormat", {})
                          .get("textFormat", {})
                          .get("foregroundColor", {}))
-            is_red = (color.get("red", 0) > 0.9
-                      and color.get("green", 0) < 0.1
-                      and color.get("blue", 0) < 0.1)
-            if not is_red:
-                continue
+            r_val  = color.get("red",   0)
+            g_val  = color.get("green", 0)
+            b_val  = color.get("blue",  0)
+            is_red = r_val > 0.9 and g_val < 0.1 and b_val < 0.1
 
             cell_val = (cell.get("effectiveValue", {})
                             .get("stringValue", "")).strip()
-            if not cell_val:
+            log.info(f"  Z{abs_row}: '{cell_val}' rgb=({r_val:.2f},{g_val:.2f},{b_val:.2f}) red={is_red}")
+
+            if not is_red or not cell_val:
                 continue
 
             translated = car_translate_map.get(cell_val.lower())
@@ -992,14 +993,14 @@ async def cmd_check(channel):
             color = (cell.get("effectiveFormat", {})
                          .get("textFormat", {})
                          .get("foregroundColor", {}))
-            is_red = (color.get("red", 0) > 0.9
-                      and color.get("green", 0) < 0.1
-                      and color.get("blue", 0) < 0.1)
-            if not is_red:
-                continue
+            r_val  = color.get("red",   0)
+            g_val  = color.get("green", 0)
+            b_val  = color.get("blue",  0)
+            is_red = r_val > 0.9 and g_val < 0.1 and b_val < 0.1
             cell_val = (cell.get("effectiveValue", {})
                             .get("stringValue", "")).strip()
-            if not cell_val:
+            log.info(f"  DrvZ{abs_row}: '{cell_val}' rgb=({r_val:.2f},{g_val:.2f},{b_val:.2f}) red={is_red}")
+            if not is_red or not cell_val:
                 continue
             match = gt7_name_map.get(cell_val.lower())
             if match:
@@ -1204,16 +1205,29 @@ async def process_image(message, attachment):
             f.write(img_data)
 
         processing_ids.add(message.id)  # Verhindert Doppel-Scan waehrend Verarbeitung
-        status_msg = await channel.send("Screenshot wird verarbeitet...")
+        # Status erst posten wenn kein Quota-Problem bekannt
+        status_msg = None
+        if not gemini_is_blocked():
+            status_msg = await channel.send("Screenshot wird verarbeitet...")
 
-        data  = analyse_image(tmp_path)
+        try:
+            data = analyse_image(tmp_path)
+        except Exception:
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            raise  # Weiterwerfen damit except-Bloecke greifen
+
         sheet = get_sheet()
         warnings, rennen, grid_label, first_pos = write_results(sheet, data)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
         # Seite bestimmen: P1 = Seite 1, sonst Seite 2
         page = 1 if (first_pos is None or first_pos == 1) else 2
@@ -1250,14 +1264,18 @@ async def process_image(message, attachment):
 
     except GeminiQuotaError as qe:
         global quota_msg
-        reset_time = gemini_blocked_until.strftime("%H:%M") if gemini_blocked_until else "?"
+        if gemini_blocked_until:
+            remaining = int((gemini_blocked_until - datetime.now()).total_seconds() / 60)
+            wait_str  = f"ca. {remaining} Minuten" if remaining > 1 else "ca. 1 Minute"
+        else:
+            wait_str = "kurze Zeit"
         if str(qe) == "daily":
             text = (f"⏳ Gemini Tageslimit erreicht. "
-                    f"Auswertung pausiert bis ca. {reset_time} Uhr. "
+                    f"Auswertung pausiert fuer {wait_str}. "
                     f"Bild wird dann automatisch verarbeitet.")
         else:
             text = (f"⏳ Gemini Minutenlimit erreicht. "
-                    f"Auswertung pausiert bis {reset_time} Uhr. "
+                    f"Auswertung pausiert fuer {wait_str}. "
                     f"Bild wird automatisch verarbeitet.")
         try:
             if quota_msg:
