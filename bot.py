@@ -801,109 +801,6 @@ def is_legend_embed(message):
             return True
     return False
 
-async def cmd_cars(channel):
-    """
-    !cars - Befuellt Car_Translate Tabellenblatt.
-    Spalte A: Autoname aus DB_tech (nur neue Eintraege).
-    Spalte B: Spielname aus GT7, von Gemini ermittelt.
-    Bestehende Zeilen werden nie veraendert.
-    """
-    status = await channel.send("Fahrzeugliste wird abgeglichen...")
-    try:
-        wb              = get_workbook()
-        db_tech         = wb.worksheet("DB_tech")
-        car_translate   = wb.worksheet("Car_Translate")
-
-        # Alle bekannten Autos aus DB_tech (Spalte R ab Zeile 8)
-        db_cars = [row[0].strip() for row in db_tech.get("R8:R300") if row and row[0].strip()]
-
-        # Bereits eingetragene Autos aus Car_Translate (Spalte A ab Zeile 2)
-        # Zeile 1 = Ueberschrift
-        existing_rows = car_translate.get("A2:B1000")
-        existing_map  = {}  # {lower_tabellenname: row_index (1-basiert, absolut)}
-        for i, row in enumerate(existing_rows, start=2):
-            if row and row[0].strip():
-                existing_map[row[0].strip().lower()] = i
-
-        # Neue Autos bestimmen (anhand Tabellenname in Spalte A)
-        new_cars = [c for c in db_cars if c.lower() not in existing_map]
-
-        if not new_cars:
-            await status.edit(content=f"Alle {len(db_cars)} Fahrzeuge bereits eingetragen. Nichts zu tun.")
-            return
-
-        await status.edit(content=f"{len(new_cars)} neue Fahrzeuge gefunden, frage Gemini...")
-
-        # Startzeile fuer neue Eintraege (nach letztem vorhandenen Eintrag, mind. Zeile 2)
-        next_row = max(len(existing_rows) + 2, 2) if existing_rows else 2
-
-        added   = 0
-        failed  = []
-        for car in new_cars:
-            prompt = (
-                f"In Gran Turismo 7, welches als Gr. 3 eingestufte Auto ist wohl "
-                f'"{car}" und wie heißt es im Spiel? '
-                f"Keine Erlaeuterungen, nur der Name."
-            )
-            try:
-                response  = gemini_model.generate_content(prompt, generation_config=GENERATION_CONFIG)
-                game_name = response.text.strip()
-                # Sicherheitscheck: Antwort sollte nicht zu lang sein
-                if len(game_name) > 100:
-                    game_name = game_name[:100]
-                car_translate.update(
-                    f"A{next_row}:B{next_row}",
-                    [[car, game_name]]
-                )
-                log.info(f"!cars: '{car}' -> '{game_name}'")
-                next_row += 1
-                added    += 1
-                await asyncio.sleep(1.5)  # Rate-Limit vermeiden
-            except Exception as e:
-                log.warning(f"!cars: Gemini-Fehler fuer '{car}': {e}")
-                failed.append(car)
-                # Trotzdem eintragen, Spalte B leer lassen
-                try:
-                    car_translate.update(f"A{next_row}", [[car]])
-                    next_row += 1
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
-
-        result = f"{added} neue Fahrzeuge eingetragen."
-        if failed:
-            result += f" Bei {len(failed)} konnte Gemini nicht befragt werden: {', '.join(failed[:5])}"
-        await status.edit(content=result)
-        load_car_list()  # Uebersetzungstabelle neu einlesen
-        log.info(f"!cars abgeschlossen: {added} neu, {len(failed)} Fehler.")
-
-    except Exception as e:
-        log.error(f"!cars Fehler: {e}", exc_info=True)
-        await status.edit(content=f"Fehler bei !cars: {e}")
-
-
-def sheets_api_get_rows(range_str):
-    """Liest Zellwerte und Formatierungen via Sheets REST API.
-    Gibt rowData-Liste zurueck."""
-    import google.auth.transport.requests as gtr
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    # Service-Account-Credentials brauchen kein Refresh - Token wird on-demand generiert
-    creds.refresh(gtr.Request())
-    url = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
-           f"?includeGridData=true&ranges={range_str}"
-           f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
-    resp = requests.get(url, headers={"Authorization": f"Bearer {creds.token}"})
-    resp.raise_for_status()
-    return (resp.json()
-               .get("sheets", [{}])[0]
-               .get("data", [{}])[0]
-               .get("rowData", []))
-
 
 async def cmd_check(channel):
     """
@@ -1308,9 +1205,6 @@ async def handle_command(message):
             await channel.send(embed=embed)
             log.info(f"!race: Race-Kasten fuer Rennen {rn} erstellt.")
             await check_gemini_version(channel)
-
-        elif cmd == "!cars":
-            await cmd_cars(channel)
 
         elif cmd == "!check":
             await cmd_check(channel)
