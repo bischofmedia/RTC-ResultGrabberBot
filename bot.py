@@ -212,38 +212,23 @@ def load_driver_list():
         wb    = get_workbook()
         sheet = wb.worksheet("DB_drvr")
 
-        # Header-Zeile lesen um Spalte "DB" zu finden
-        # Annahme: Header in Zeile 4 (eine Zeile ueber den Daten ab Zeile 5)
-        header_row = sheet.row_values(4)
-        db_col_idx = None
-        for i, h in enumerate(header_row):
-            if h.strip().upper() == "DB":
-                db_col_idx = i  # 0-basiert relativ zum Start der Zeile
-                break
-
-        # Vollstaendige Zeilen lesen - breit genug fuer alle Spalten
-        # C=Index 2 (1-basiert), wir lesen ab C also relativer Index 0
-        # K=Index 10 (1-basiert), relativ zu C = Index 8
-        # DB-Spalte: absoluter Index db_col_idx, relativ zu A = db_col_idx
-        #   relativ zu C = db_col_idx - 2
-        end_col = max(10, db_col_idx if db_col_idx else 0) + 1
-        from gspread.utils import rowcol_to_a1
-        end_col_letter = rowcol_to_a1(1, end_col + 1)[:-1]  # nur Buchstabe
-        rows = sheet.get(f"C5:{end_col_letter}200")
+        # Spalte C+K: Tabellenname und Team
+        rows_ck  = sheet.get("C5:K200")
+        # Spalte DB: GT7-Spielnamen (separate Abfrage)
+        rows_db  = sheet.get("DB5:DB200")
 
         driver_map   = {}
         gt7_name_map = {}
-        db_rel_idx   = (db_col_idx - 2) if db_col_idx is not None else None
 
-        for row in rows:
+        for i, row in enumerate(rows_ck):
             name = row[0].strip() if len(row) > 0 else ""
             team = row[8].strip() if len(row) > 8 else ""
-            gt7_name = ""
-            if db_rel_idx is not None and len(row) > db_rel_idx:
-                gt7_name = row[db_rel_idx].strip()
             if name:
                 driver_map[name.lower()] = (name, team)
-            if gt7_name:
+            # GT7-Name aus Spalte DB, gleiche Zeile
+            gt7_row  = rows_db[i] if i < len(rows_db) else []
+            gt7_name = gt7_row[0].strip() if gt7_row else ""
+            if gt7_name and name:
                 gt7_name_map[gt7_name.lower()] = (name, team)
 
         if not driver_map:
