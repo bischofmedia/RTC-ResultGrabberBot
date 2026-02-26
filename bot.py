@@ -929,6 +929,8 @@ async def cmd_check(channel):
         data_range = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_car)}"
         rows = sheet.get(data_range)
 
+        # Immer frisch laden damit neue Eintraege sofort wirken
+        load_car_list()
         driver_map, gt7_name_map = load_driver_list()
 
         batch_vals  = {}
