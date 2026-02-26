@@ -911,11 +911,11 @@ def sheets_api_get_rows(range_str):
 
 async def cmd_check(channel):
     """
-    !check - Sucht rote Auto-Zellen im aktuellen Rennen und versucht
-    sie anhand der Car_Translate-Tabelle zu korrigieren.
-    Liest Zelleigenschaften via gspread spreadsheet.get() mit includeGridData.
+    !check - Liest alle Fahrer- und Auto-Eintraege des aktuellen Rennens,
+    prueft jeden gegen die Uebersetzungstabellen und korrigiert wo moeglich.
+    Gibt eine Liste aller Abweichungen aus.
     """
-    status = await channel.send("Suche rote Eintraege...")
+    status = await channel.send("Prüfe Eintraege...")
     try:
         _, rennen = await find_last_race_box(channel)
         if rennen is None:
@@ -924,108 +924,77 @@ async def cmd_check(channel):
 
         sheet    = get_sheet()
         cs       = col_start(rennen)
-        c_car    = cs + REL["car"]
         row_from = FIRST_DATA_ROW
         row_to   = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
-        car_range = f"{rowcol_to_a1(row_from, c_car)}:{rowcol_to_a1(row_to, c_car)}"
+        c_drv    = cs + REL["driver"]
+        c_car    = cs + REL["car"]
 
-        # Zelleigenschaften inkl. Formatierung lesen via Sheets REST API
-        rows_data = sheets_api_get_rows(f"T!{car_range}")
+        # Fahrer und Autos in einem Aufruf lesen
+        data_range = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_car)}"
+        rows = sheet.get(data_range)
 
-        corrected    = 0
-        batch_vals   = {}
-        grey_cells_c = []
+        driver_map, gt7_name_map = load_driver_list()
 
-        for i, row_d in enumerate(rows_data):
-            abs_row = row_from + i
-            vals    = row_d.get("values", [])
-            if not vals:
-                continue
-            cell  = vals[0]
-            color = (cell.get("effectiveFormat", {})
-                         .get("textFormat", {})
-                         .get("foregroundColor", {}))
-            r_val  = color.get("red",   0)
-            g_val  = color.get("green", 0)
-            b_val  = color.get("blue",  0)
-            is_red = r_val > 0.9 and g_val < 0.1 and b_val < 0.1
+        batch_vals  = {}
+        grey_cells  = []
+        report      = []  # [(typ, original, korrigiert_zu, ok)]
 
-            cell_val = (cell.get("effectiveValue", {})
-                            .get("stringValue", "")).strip()
-            log.info(f"  Z{abs_row}: '{cell_val}' rgb=({r_val:.2f},{g_val:.2f},{b_val:.2f}) red={is_red}")
+        for i, row in enumerate(rows):
+            abs_row  = row_from + i
+            drv_val  = row[0].strip() if len(row) > 0 else ""
+            car_val  = row[REL["car"] - REL["driver"]].strip() if len(row) > (REL["car"] - REL["driver"]) else ""
 
-            if not is_red or not cell_val:
-                continue
+            # Fahrer pruefen
+            if drv_val:
+                if drv_val.lower() in driver_map:
+                    pass  # korrekt
+                elif drv_val.lower() in gt7_name_map:
+                    korrigiert, _ = gt7_name_map[drv_val.lower()]
+                    batch_vals[rowcol_to_a1(abs_row, c_drv)] = korrigiert
+                    grey_cells.append((abs_row, c_drv))
+                    report.append(("Fahrer", drv_val, korrigiert, True))
+                else:
+                    report.append(("Fahrer", drv_val, None, False))
 
-            translated = car_translate_map.get(cell_val.lower())
-            if translated:
-                batch_vals[rowcol_to_a1(abs_row, c_car)] = translated
-                grey_cells_c.append((abs_row, c_car))
-                corrected += 1
-                log.info(f"!check: '{cell_val}' -> '{translated}' (Z{abs_row})")
+            # Auto pruefen
+            if car_val:
+                # Ist der Wert bereits ein gueltiger Tabellenname?
+                valid_tabellen = {c.lower() for c in car_list}
+                if car_val.lower() in valid_tabellen:
+                    pass  # korrekt
+                elif car_val.lower() in car_translate_map:
+                    korrigiert = car_translate_map[car_val.lower()]
+                    batch_vals[rowcol_to_a1(abs_row, c_car)] = korrigiert
+                    grey_cells.append((abs_row, c_car))
+                    report.append(("Auto", car_val, korrigiert, True))
+                else:
+                    # Evtl. ist es schon ein Tabellenname aber nicht in DB_tech?
+                    # Nur melden wenn auch kein Tabellenname
+                    report.append(("Auto", car_val, None, False))
 
-        if corrected == 0:
-            await status.edit(content="Keine korrigierbaren roten Auto-Eintraege gefunden.")
-            return
-
-        sheet.batch_update([
-            {"range": addr, "values": [[val]]}
-            for addr, val in batch_vals.items()
-        ])
-        batch_format_cells(sheet, grey_cells_c, [])
-
-        # ── Fahrer-Spalte pruefen ─────────────────────────────────────────────
-        c_drv      = cs + REL["driver"]
-        drv_range  = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_drv)}"
-        rows_drv = sheets_api_get_rows(f"T!{drv_range}")
-
-        _, gt7_name_map = load_driver_list()
-        grey_cells_d    = []
-        batch_drv       = {}
-        corrected_drv   = 0
-
-        for i, row_d in enumerate(rows_drv):
-            abs_row = row_from + i
-            vals    = row_d.get("values", [])
-            if not vals:
-                continue
-            cell  = vals[0]
-            color = (cell.get("effectiveFormat", {})
-                         .get("textFormat", {})
-                         .get("foregroundColor", {}))
-            r_val  = color.get("red",   0)
-            g_val  = color.get("green", 0)
-            b_val  = color.get("blue",  0)
-            is_red = r_val > 0.9 and g_val < 0.1 and b_val < 0.1
-            cell_val = (cell.get("effectiveValue", {})
-                            .get("stringValue", "")).strip()
-            log.info(f"  DrvZ{abs_row}: '{cell_val}' rgb=({r_val:.2f},{g_val:.2f},{b_val:.2f}) red={is_red}")
-            if not is_red or not cell_val:
-                continue
-            match = gt7_name_map.get(cell_val.lower())
-            if match:
-                tabellenname, _ = match
-                batch_drv[rowcol_to_a1(abs_row, c_drv)] = tabellenname
-                grey_cells_d.append((abs_row, c_drv))
-                corrected_drv += 1
-                log.info(f"!check drv: '{cell_val}' -> '{tabellenname}' (Z{abs_row})")
-
-        if batch_drv:
+        # Korrekturen schreiben
+        if batch_vals:
             sheet.batch_update([
                 {"range": addr, "values": [[val]]}
-                for addr, val in batch_drv.items()
+                for addr, val in batch_vals.items()
             ])
-            batch_format_cells(sheet, grey_cells_d, [])
+            batch_format_cells(sheet, grey_cells, [])
 
-        total = corrected + corrected_drv
-        if total == 0:
-            await status.edit(content="Keine korrigierbaren roten Eintraege gefunden.")
+        # Meldung aufbauen
+        await status.delete()
+        if not report:
+            await channel.send("✅ Alle Fahrer und Fahrzeuge korrekt.")
         else:
-            parts = []
-            if corrected:     parts.append(f"{corrected} Auto(s)")
-            if corrected_drv: parts.append(f"{corrected_drv} Fahrer")
-            await status.edit(content=f"{' und '.join(parts)} korrigiert.")
-        log.info(f"!check: {corrected} Autos, {corrected_drv} Fahrer korrigiert (Rennen {rennen}).")
+            lines = [f"**!check Rennen {rennen:02d}**"]
+            for typ, original, korrigiert, ok in report:
+                if ok:
+                    lines.append(f"✅ {typ}: `{original}` → `{korrigiert}`")
+                else:
+                    lines.append(f"❌ {typ}: `{original}` – nicht in Tabelle")
+            await channel.send("\n".join(lines))
+
+        log.info(f"!check: {len([r for r in report if r[3]])} korrigiert, "
+                 f"{len([r for r in report if not r[3]])} nicht gefunden.")
 
     except Exception as e:
         log.error(f"!check Fehler: {e}", exc_info=True)
