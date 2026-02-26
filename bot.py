@@ -719,7 +719,7 @@ def build_legend_embed(downloaded):
         description=f"-# {line1}\n-# {line2}",
         color=0x2b2d31
     )
-    embed.set_footer(text="legend")
+    embed.set_footer(text="​")  # Unsichtbares Zeichen als Marker
     return embed
 
 def is_legend_embed(message):
@@ -729,7 +729,7 @@ def is_legend_embed(message):
     if message.author.id != discord_client.user.id:
         return False
     for embed in message.embeds:
-        if embed.footer and embed.footer.text == "legend":
+        if embed.footer and embed.footer.text == "​":
             return True
     return False
 
@@ -828,14 +828,13 @@ async def cmd_sort(channel):
             os.unlink(tmp_path)
         await asyncio.sleep(0.3)
 
-    # Textnachrichten ans Ende (alte Reihenfolge, aelteste zuerst)
+    log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
+    await update_legend(channel, downloaded)
+    # Textnachrichten nach der Legende
     text_msgs.reverse()
     for _, content_txt in text_msgs:
         await channel.send(content_txt)
         await asyncio.sleep(0.3)
-
-    log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
-    await update_legend(channel, downloaded)
 
 
 async def _repost_texts(channel, text_msgs):
