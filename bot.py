@@ -53,6 +53,9 @@ class GeminiQuotaError(Exception):
 # Nachrichten-IDs die gerade verarbeitet werden (verhindert Doppel-Scan)
 processing_ids: set = set()
 
+# Aktuelle Quota-Warn-Nachricht (wird geupdated statt neu gepostet)
+quota_msg = None
+
 # Grid-Farb-Emojis und Seite-Emojis
 GRID_EMOJI = {
     "1":  "🟡",  # 🟡 gelb
@@ -414,10 +417,21 @@ def call_gemini(img, prompt):
         text = re.sub(r"\s*```$",     "", text)
         return json.loads(text)
     except ResourceExhausted as e:
-        log.error(f"Gemini ResourceExhausted: {str(e)}")
-        gemini_blocked_until = datetime.now() + timedelta(minutes=GEMINI_BACKOFF_MINUTES)
-        log.error(f"Gemini-Sperre fuer {GEMINI_BACKOFF_MINUTES} Minuten.")
-        raise GeminiQuotaError("Gemini-Kontingent erschoepft") from e
+        err_str = str(e).lower()
+        if "per day" in err_str or "daily" in err_str or "quota_exceeded" in err_str:
+            # Tageslimit: bis 09:00 Uhr lokaler Zeit (Google Reset = 0 Uhr Pacific = 9 Uhr DE)
+            now  = datetime.now()
+            reset = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now >= reset:
+                reset += timedelta(days=1)
+            gemini_blocked_until = reset
+            log.error(f"Gemini Tageslimit erreicht. Sperre bis {reset.strftime('%H:%M')} Uhr.")
+            raise GeminiQuotaError("daily") from e
+        else:
+            # Minutenlimit: kurze Pause
+            gemini_blocked_until = datetime.now() + timedelta(minutes=1)
+            log.warning("Gemini Minutenlimit erreicht. Sperre fuer 1 Minute.")
+            raise GeminiQuotaError("rpm") from e
     except Exception as e:
         log.error(f"Gemini Fehler ({type(e).__name__}): {str(e)}")
         raise
@@ -431,6 +445,16 @@ def gemini_is_blocked():
         log.info("Gemini-Sperre aufgehoben.")
         return False
     return True
+
+async def clear_quota_msg(channel):
+    """Loescht die Quota-Warnmeldung wenn Sperre aufgehoben."""
+    global quota_msg
+    if quota_msg:
+        try:
+            await quota_msg.delete()
+        except Exception:
+            pass
+        quota_msg = None
 
 async def check_gemini_version(channel):
     """Fragt Gemini ob die aktuelle Version noch empfehlenswert ist. Wird bei neuen Rennkaesten aufgerufen."""
@@ -882,13 +906,24 @@ async def cmd_check(channel):
         row_to   = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
         car_range = f"{rowcol_to_a1(row_from, c_car)}:{rowcol_to_a1(row_to, c_car)}"
 
-        # Zelleigenschaften inkl. Formatierung lesen
-        resp = sheet.spreadsheet.fetch_sheet_metadata(
-            params={"includeGridData": True, "ranges": [f"T!{car_range}"]}
-        )
-        rows_data = (resp.get("sheets", [{}])[0]
-                        .get("data", [{}])[0]
-                        .get("rowData", []))
+        # Zelleigenschaften inkl. Formatierung lesen via Sheets REST API
+        creds   = get_gspread_client().auth
+        import requests as req_lib
+        token   = creds.token if hasattr(creds, "token") else creds.valid
+        # Token auffrischen falls noetig
+        if hasattr(creds, "expired") and creds.expired:
+            import google.auth.transport.requests as gtr
+            creds.refresh(gtr.Request())
+        api_url = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
+                   f"?includeGridData=true&ranges=T!{car_range}"
+                   f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
+        headers  = {"Authorization": f"Bearer {creds.token}"}
+        api_resp = req_lib.get(api_url, headers=headers)
+        api_resp.raise_for_status()
+        rows_data = (api_resp.json()
+                             .get("sheets", [{}])[0]
+                             .get("data", [{}])[0]
+                             .get("rowData", []))
 
         corrected    = 0
         batch_vals   = {}
@@ -934,12 +969,15 @@ async def cmd_check(channel):
         # ── Fahrer-Spalte pruefen ─────────────────────────────────────────────
         c_drv      = cs + REL["driver"]
         drv_range  = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_drv)}"
-        resp_drv   = sheet.spreadsheet.fetch_sheet_metadata(
-            params={"includeGridData": True, "ranges": [f"T!{drv_range}"]}
-        )
-        rows_drv   = (resp_drv.get("sheets", [{}])[0]
-                              .get("data", [{}])[0]
-                              .get("rowData", []))
+        api_url_drv = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
+                        f"?includeGridData=true&ranges=T!{drv_range}"
+                        f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
+        api_resp_drv = req_lib.get(api_url_drv, headers=headers)
+        api_resp_drv.raise_for_status()
+        rows_drv     = (api_resp_drv.json()
+                                    .get("sheets", [{}])[0]
+                                    .get("data", [{}])[0]
+                                    .get("rowData", []))
 
         _, gt7_name_map = load_driver_list()
         grey_cells_d    = []
@@ -1211,12 +1249,25 @@ async def process_image(message, attachment):
         log.info(f"Verarbeitet in {elapsed:.1f}s. {len(warnings)} Warnung(en).")
         success = True
 
-    except GeminiQuotaError:
-        await channel.send(
-            f"Gemini-Tageskontingent erschoepft. Auswertung pausiert fuer ca. "
-            f"{GEMINI_BACKOFF_MINUTES} Minuten. Bild wird automatisch verarbeitet."
-        )
-        log.warning("Quota-Fehler, kein Emoji gesetzt.")
+    except GeminiQuotaError as qe:
+        global quota_msg
+        reset_time = gemini_blocked_until.strftime("%H:%M") if gemini_blocked_until else "?"
+        if str(qe) == "daily":
+            text = (f"⏳ Gemini Tageslimit erreicht. "
+                    f"Auswertung pausiert bis ca. {reset_time} Uhr. "
+                    f"Bild wird dann automatisch verarbeitet.")
+        else:
+            text = (f"⏳ Gemini Minutenlimit erreicht. "
+                    f"Auswertung pausiert bis {reset_time} Uhr. "
+                    f"Bild wird automatisch verarbeitet.")
+        try:
+            if quota_msg:
+                await quota_msg.edit(content=text)
+            else:
+                quota_msg = await channel.send(text)
+        except Exception:
+            quota_msg = await channel.send(text)
+        log.warning(f"Quota-Fehler ({qe}), kein Emoji gesetzt.")
         success = None
 
     except Exception as e:
@@ -1370,7 +1421,15 @@ async def scan_channel():
         try:
             if gemini_is_blocked():
                 mins = int((gemini_blocked_until - datetime.now()).total_seconds() / 60)
-                log.info(f"Gemini gesperrt, ueberspringe Scan. Noch ca. {mins} Minuten.")
+                log.info(f"Gemini gesperrt, ueberspringe Bild-Scan. Noch ca. {mins} Minuten.")
+                # Befehle trotzdem verarbeiten (kein Gemini noetig)
+                async for message in channel.history(limit=20):
+                    if (message.content.startswith("!")
+                            and message.author.id != discord_client.user.id):
+                        await handle_command(message)
+                # Sperre aufgehoben?
+                if not gemini_is_blocked():
+                    await clear_quota_msg(channel)
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
