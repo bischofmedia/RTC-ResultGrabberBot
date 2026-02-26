@@ -760,7 +760,6 @@ async def cmd_cars(channel):
         car_translate   = wb.worksheet("Car_Translate")
 
         # Alle bekannten Autos aus DB_tech (Spalte R ab Zeile 8)
-        db_cars = [v.strip() for v in db_tech.get("R8:R300") if v and v[0].strip()]
         db_cars = [row[0].strip() for row in db_tech.get("R8:R300") if row and row[0].strip()]
 
         # Bereits eingetragene Autos aus Car_Translate (Spalte A ab Zeile 2)
@@ -826,6 +825,82 @@ async def cmd_cars(channel):
     except Exception as e:
         log.error(f"!cars Fehler: {e}", exc_info=True)
         await status.edit(content=f"Fehler bei !cars: {e}")
+
+
+async def cmd_translate(channel):
+    """
+    !translate - Sucht rote Auto-Zellen im aktuellen Rennen und versucht
+    sie anhand der Car_Translate-Tabelle zu korrigieren.
+    Liest Zelleigenschaften via gspread spreadsheet.get() mit includeGridData.
+    """
+    status = await channel.send("Suche rote Eintraege...")
+    try:
+        _, rennen = await find_last_race_box(channel)
+        if rennen is None:
+            await status.edit(content="Kein Race-Kasten gefunden.")
+            return
+
+        sheet    = get_sheet()
+        cs       = col_start(rennen)
+        c_car    = cs + REL["car"]
+        row_from = FIRST_DATA_ROW
+        row_to   = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
+        car_range = f"{rowcol_to_a1(row_from, c_car)}:{rowcol_to_a1(row_to, c_car)}"
+
+        # Zelleigenschaften inkl. Formatierung lesen
+        resp = sheet.spreadsheet.fetch_sheet_metadata(
+            params={"includeGridData": True, "ranges": [f"T!{car_range}"]}
+        )
+        rows_data = (resp.get("sheets", [{}])[0]
+                        .get("data", [{}])[0]
+                        .get("rowData", []))
+
+        corrected    = 0
+        batch_vals   = {}
+        grey_cells_c = []
+
+        for i, row_d in enumerate(rows_data):
+            abs_row = row_from + i
+            vals    = row_d.get("values", [])
+            if not vals:
+                continue
+            cell  = vals[0]
+            color = (cell.get("effectiveFormat", {})
+                         .get("textFormat", {})
+                         .get("foregroundColor", {}))
+            is_red = (color.get("red", 0) > 0.9
+                      and color.get("green", 0) < 0.1
+                      and color.get("blue", 0) < 0.1)
+            if not is_red:
+                continue
+
+            cell_val = (cell.get("effectiveValue", {})
+                            .get("stringValue", "")).strip()
+            if not cell_val:
+                continue
+
+            translated = car_translate_map.get(cell_val.lower())
+            if translated:
+                batch_vals[rowcol_to_a1(abs_row, c_car)] = translated
+                grey_cells_c.append((abs_row, c_car))
+                corrected += 1
+                log.info(f"!translate: '{cell_val}' -> '{translated}' (Z{abs_row})")
+
+        if corrected == 0:
+            await status.edit(content="Keine korrigierbaren roten Auto-Eintraege gefunden.")
+            return
+
+        sheet.batch_update([
+            {"range": addr, "values": [[val]]}
+            for addr, val in batch_vals.items()
+        ])
+        batch_format_cells(sheet, grey_cells_c, [])
+        await status.edit(content=f"{corrected} Auto(s) korrigiert.")
+        log.info(f"!translate: {corrected} Korrekturen fuer Rennen {rennen}.")
+
+    except Exception as e:
+        log.error(f"!translate Fehler: {e}", exc_info=True)
+        await status.edit(content=f"Fehler: {type(e).__name__}: {str(e)[:200]}")
 
 
 async def update_legend(channel, downloaded):
@@ -1104,6 +1179,9 @@ async def handle_command(message):
 
         elif cmd == "!cars":
             await cmd_cars(channel)
+
+        elif cmd == "!translate":
+            await cmd_translate(channel)
 
         elif cmd == "!update":
             load_car_list()
