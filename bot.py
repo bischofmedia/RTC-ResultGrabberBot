@@ -43,6 +43,10 @@ gemini_blocked_until = None
 # In-memory Fahrzeugliste (wird beim Start und bei !update geladen)
 car_list = []
 
+# Uebersetzungstabelle: {spielname_lower: tabellenname}
+# Spielname = Spalte B, Tabellenname = Spalte A in Car_Translate
+car_translate_map: dict = {}
+
 class GeminiQuotaError(Exception):
     pass
 
@@ -163,21 +167,36 @@ def get_workbook():
 
 # ── Fahrzeug- und Fahrerliste laden ──────────────────────────────────────────
 def load_car_list():
-    """Laedt Fahrzeugliste aus DB_Tech, Spalte R ab Zeile 8."""
-    global car_list
+    """Laedt Fahrzeugliste aus DB_tech und Uebersetzungstabelle aus Car_Translate."""
+    global car_list, car_translate_map
     try:
         wb    = get_workbook()
         sheet = wb.worksheet("DB_tech")
-        # Begrenzten Bereich lesen (R8:R300) statt gesamte Spalte
         vals  = sheet.get("R8:R300")
         car_list = [row[0].strip() for row in vals if row and row[0].strip()]
         if not car_list:
-            log.warning("Fahrzeugliste ist leer! Bitte DB_Tech pruefen (Spalte R ab Zeile 8).")
+            log.warning("Fahrzeugliste ist leer! Bitte DB_tech pruefen (Spalte R ab Zeile 8).")
         else:
             log.info(f"Fahrzeugliste geladen: {len(car_list)} Eintraege")
     except Exception as e:
         log.error(f"KRITISCH: Fahrzeugliste konnte nicht geladen werden: {e}")
         car_list = []
+
+    # Car_Translate laden: Spalte A = Tabellenname, Spalte B = Spielname
+    try:
+        wb    = get_workbook()
+        sheet = wb.worksheet("Car_Translate")
+        rows  = sheet.get("A2:B1000")  # Zeile 1 = Ueberschrift
+        car_translate_map = {}
+        for row in rows:
+            tabellenname = row[0].strip() if len(row) > 0 else ""
+            spielname    = row[1].strip() if len(row) > 1 else ""
+            if tabellenname and spielname:
+                car_translate_map[spielname.lower()] = tabellenname
+        log.info(f"Car_Translate geladen: {len(car_translate_map)} Eintraege")
+    except Exception as e:
+        log.warning(f"Car_Translate nicht geladen (noch nicht angelegt?): {e}")
+        car_translate_map = {}
 
 def load_driver_list():
     """Laedt Fahrerliste aus DB_drvr, Spalte C (Name) und K (Team) ab Zeile 5.
@@ -309,21 +328,14 @@ gemini_model      = genai.GenerativeModel(GEMINI_MODEL)
 GENERATION_CONFIG = genai.GenerationConfig(temperature=0)
 
 def build_extract_prompt():
-    """Erstellt den Extraktions-Prompt mit aktueller Fahrzeugliste."""
-    car_list_str = "\n".join(f"- {c}" for c in car_list) if car_list else "(keine Liste verfuegbar)"
+    """Erstellt den Extraktions-Prompt. Fahrzeugname wird exakt aus Bild gelesen."""
     return (
         "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
         "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
         "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
         "Beispiel: 'Bismark' bleibt 'Bismark', 'XxChillerHDxX95' bleibt exakt so.\n\n"
-        "FAHRZEUGNAMEN: Nutze IMMER den passenden Namen aus dieser Liste:\n"
-        f"{car_list_str}\n\n"
-        "Matching-Regeln fuer Fahrzeuge:\n"
-        "- Nutze dein Wissen ueber Hersteller (z.B. Huracan = Lamborghini)\n"
-        "- Sonderzeichen im Spielnamen koennen in der Liste fehlen (z.B. 'GT by Citroën Race Car' = 'Citroen GT')\n"
-        "- Die Jahreszahl ('22, '15 etc.) MUSS exakt uebereinstimmen\n"
-        "- Pruefe die KOMPLETTE Liste, nicht nur den ersten Treffer\n"
-        "- Wenn kein passender Eintrag: Originalnamen behalten, 'auto_unbekannt': true\n\n"
+        "FAHRZEUGNAMEN: Lies den Namen exakt so wie er im Bild steht.\n"
+        "Kopiere unveraendert, inklusive Jahreszahl, Sonderzeichen und Klammern.\n\n"
         "Format:\n"
         "{\n"
         '  "rennen": <Zahl>,\n'
@@ -332,8 +344,7 @@ def build_extract_prompt():
         "    {\n"
         '      "position": <Zahl>,\n'
         '      "name": "<exakt wie im Bild>",\n'
-        '      "auto": "<Name aus Liste oder Original>",\n'
-        '      "auto_unbekannt": <true oder false>,\n'
+        '      "auto": "<exakt wie im Bild>",\n'
         '      "zeit": "<exakt wie im Bild>",\n'
         '      "beste_runde": "<z.B. 8:27,088 oder leer>"\n'
         "    }\n"
@@ -478,8 +489,10 @@ def write_results(sheet, data):
     for fahrer in sorted(fahrer_list, key=lambda x: x["position"]):
         pos            = int(fahrer["position"])
         name_raw       = fahrer["name"]
-        auto           = fahrer["auto"]
-        auto_unbekannt = fahrer.get("auto_unbekannt", False)
+        auto_raw       = fahrer["auto"]
+        # Uebersetzung: Spielname -> Tabellenname via Car_Translate
+        auto           = car_translate_map.get(auto_raw.lower(), auto_raw)
+        auto_unbekannt = auto == auto_raw and auto_raw.lower() not in car_translate_map
         zeit           = fahrer.get("zeit", "")
         beste_runde    = fahrer.get("beste_runde", "")
 
@@ -732,6 +745,88 @@ def is_legend_embed(message):
         if embed.footer and embed.footer.text == "​":
             return True
     return False
+
+async def cmd_cars(channel):
+    """
+    !cars - Befuellt Car_Translate Tabellenblatt.
+    Spalte A: Autoname aus DB_tech (nur neue Eintraege).
+    Spalte B: Spielname aus GT7, von Gemini ermittelt.
+    Bestehende Zeilen werden nie veraendert.
+    """
+    status = await channel.send("Fahrzeugliste wird abgeglichen...")
+    try:
+        wb              = get_workbook()
+        db_tech         = wb.worksheet("DB_tech")
+        car_translate   = wb.worksheet("Car_Translate")
+
+        # Alle bekannten Autos aus DB_tech (Spalte R ab Zeile 8)
+        db_cars = [v.strip() for v in db_tech.get("R8:R300") if v and v[0].strip()]
+        db_cars = [row[0].strip() for row in db_tech.get("R8:R300") if row and row[0].strip()]
+
+        # Bereits eingetragene Autos aus Car_Translate (Spalte A ab Zeile 2)
+        # Zeile 1 = Ueberschrift
+        existing_rows = car_translate.get("A2:B1000")
+        existing_map  = {}  # {lower_tabellenname: row_index (1-basiert, absolut)}
+        for i, row in enumerate(existing_rows, start=2):
+            if row and row[0].strip():
+                existing_map[row[0].strip().lower()] = i
+
+        # Neue Autos bestimmen (anhand Tabellenname in Spalte A)
+        new_cars = [c for c in db_cars if c.lower() not in existing_map]
+
+        if not new_cars:
+            await status.edit(content=f"Alle {len(db_cars)} Fahrzeuge bereits eingetragen. Nichts zu tun.")
+            return
+
+        await status.edit(content=f"{len(new_cars)} neue Fahrzeuge gefunden, frage Gemini...")
+
+        # Startzeile fuer neue Eintraege (nach letztem vorhandenen Eintrag, mind. Zeile 2)
+        next_row = max(len(existing_rows) + 2, 2) if existing_rows else 2
+
+        added   = 0
+        failed  = []
+        for car in new_cars:
+            prompt = (
+                f"In Gran Turismo 7, welches als Gr. 3 eingestufte Auto ist wohl "
+                f'"{car}" und wie heißt es im Spiel? '
+                f"Keine Erlaeuterungen, nur der Name."
+            )
+            try:
+                response  = gemini_model.generate_content(prompt, generation_config=GENERATION_CONFIG)
+                game_name = response.text.strip()
+                # Sicherheitscheck: Antwort sollte nicht zu lang sein
+                if len(game_name) > 100:
+                    game_name = game_name[:100]
+                car_translate.update(
+                    f"A{next_row}:B{next_row}",
+                    [[car, game_name]]
+                )
+                log.info(f"!cars: '{car}' -> '{game_name}'")
+                next_row += 1
+                added    += 1
+                await asyncio.sleep(1.5)  # Rate-Limit vermeiden
+            except Exception as e:
+                log.warning(f"!cars: Gemini-Fehler fuer '{car}': {e}")
+                failed.append(car)
+                # Trotzdem eintragen, Spalte B leer lassen
+                try:
+                    car_translate.update(f"A{next_row}", [[car]])
+                    next_row += 1
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+        result = f"{added} neue Fahrzeuge eingetragen."
+        if failed:
+            result += f" Bei {len(failed)} konnte Gemini nicht befragt werden: {', '.join(failed[:5])}"
+        await status.edit(content=result)
+        load_car_list()  # Uebersetzungstabelle neu einlesen
+        log.info(f"!cars abgeschlossen: {added} neu, {len(failed)} Fehler.")
+
+    except Exception as e:
+        log.error(f"!cars Fehler: {e}", exc_info=True)
+        await status.edit(content=f"Fehler bei !cars: {e}")
+
 
 async def update_legend(channel, downloaded):
     """Erstellt oder aktualisiert die Legende nach den Screenshots."""
@@ -1007,6 +1102,9 @@ async def handle_command(message):
             log.info(f"!race: Race-Kasten fuer Rennen {rn} erstellt.")
             await check_gemini_version(channel)
 
+        elif cmd == "!cars":
+            await cmd_cars(channel)
+
         elif cmd == "!update":
             load_car_list()
             if len(parts) >= 2:
@@ -1196,7 +1294,7 @@ async def start_webserver():
 @discord_client.event
 async def on_ready():
     log.info(f"Eingeloggt als {discord_client.user}")
-    load_car_list()
+    load_car_list()  # laedt auch Car_Translate
     if not car_list:
         channel = discord_client.get_channel(DISCORD_CHANNEL_ID)
         if channel:
