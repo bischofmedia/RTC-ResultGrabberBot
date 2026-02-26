@@ -958,29 +958,30 @@ async def cmd_check(channel):
             # Fahrer pruefen
             if drv_val:
                 if drv_val.lower() in driver_map:
-                    pass  # korrekt
+                    pass  # bereits korrekter Tabellenname -> ok
                 elif drv_val.lower() in gt7_name_map:
+                    # GT7-Name gefunden -> in Tabellennamen uebersetzen
                     korrigiert, _ = gt7_name_map[drv_val.lower()]
                     batch_vals[rowcol_to_a1(abs_row, c_drv)] = korrigiert
                     grey_cells.append((abs_row, c_drv))
                     report.append(("Fahrer", drv_val, korrigiert, True))
                 else:
+                    # Weder Tabellenname noch bekannter GT7-Name
                     report.append(("Fahrer", drv_val, None, False))
 
             # Auto pruefen
             if car_val:
-                # Ist der Wert bereits ein gueltiger Tabellenname?
                 valid_tabellen = {c.lower() for c in car_list}
                 if car_val.lower() in valid_tabellen:
-                    pass  # korrekt
+                    pass  # bereits korrekter Tabellenname -> ok
                 elif car_val.lower() in car_translate_map:
+                    # Spielname gefunden -> in Tabellenname uebersetzen
                     korrigiert = car_translate_map[car_val.lower()]
                     batch_vals[rowcol_to_a1(abs_row, c_car)] = korrigiert
                     grey_cells.append((abs_row, c_car))
                     report.append(("Auto", car_val, korrigiert, True))
                 else:
-                    # Evtl. ist es schon ein Tabellenname aber nicht in DB_tech?
-                    # Nur melden wenn auch kein Tabellenname
+                    # Weder Tabellenname noch bekannter Spielname
                     report.append(("Auto", car_val, None, False))
 
         # Korrekturen schreiben
@@ -1179,6 +1180,8 @@ async def process_image(message, attachment):
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp_path = f.name
 
+    global quota_msg  # hier deklarieren, vor allen try/except-Bloecken
+
     try:
         img_data = requests.get(attachment.url).content
         with open(tmp_path, "wb") as f:
@@ -1253,7 +1256,6 @@ async def process_image(message, attachment):
         success = True
 
     except GeminiQuotaError as qe:
-        global quota_msg
         retry_time = berlin_time_str(gemini_blocked_until) if gemini_blocked_until else "?"
         text = f"⏳ Gemini-Limit erreicht, versuche es wieder um {retry_time} Uhr."
         # status_msg in Limit-Nachricht umwandeln statt neue zu posten
