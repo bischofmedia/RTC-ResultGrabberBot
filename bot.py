@@ -199,27 +199,59 @@ def load_car_list():
         car_translate_map = {}
 
 def load_driver_list():
-    """Laedt Fahrerliste aus DB_drvr, Spalte C (Name) und K (Team) ab Zeile 5.
-    Gibt dict {lower_name: (original_name, team)} zurueck."""
+    """Laedt Fahrerliste aus DB_drvr.
+    Spalte C = Tabellenname, Spalte K = Team, Spalte DB = GT7-Spielname.
+    Gibt zwei Dicts zurueck:
+      driver_map:    {lower_tabellenname: (tabellenname, team)}
+      gt7_name_map:  {lower_gt7name:      (tabellenname, team)}
+    """
     try:
-        wb     = get_workbook()
-        sheet  = wb.worksheet("DB_drvr")
-        # Namen und Teams in einem Aufruf lesen
-        rows   = sheet.get("C5:K200")
-        result = {}
+        wb    = get_workbook()
+        sheet = wb.worksheet("DB_drvr")
+
+        # Header-Zeile lesen um Spalte "DB" zu finden
+        # Annahme: Header in Zeile 4 (eine Zeile ueber den Daten ab Zeile 5)
+        header_row = sheet.row_values(4)
+        db_col_idx = None
+        for i, h in enumerate(header_row):
+            if h.strip().upper() == "DB":
+                db_col_idx = i  # 0-basiert relativ zum Start der Zeile
+                break
+
+        # Vollstaendige Zeilen lesen - breit genug fuer alle Spalten
+        # C=Index 2 (1-basiert), wir lesen ab C also relativer Index 0
+        # K=Index 10 (1-basiert), relativ zu C = Index 8
+        # DB-Spalte: absoluter Index db_col_idx, relativ zu A = db_col_idx
+        #   relativ zu C = db_col_idx - 2
+        end_col = max(10, db_col_idx if db_col_idx else 0) + 1
+        from gspread.utils import rowcol_to_a1
+        end_col_letter = rowcol_to_a1(1, end_col + 1)[:-1]  # nur Buchstabe
+        rows = sheet.get(f"C5:{end_col_letter}200")
+
+        driver_map   = {}
+        gt7_name_map = {}
+        db_rel_idx   = (db_col_idx - 2) if db_col_idx is not None else None
+
         for row in rows:
             name = row[0].strip() if len(row) > 0 else ""
-            team = row[8].strip() if len(row) > 8 else ""  # K ist Index 8 in C:K
+            team = row[8].strip() if len(row) > 8 else ""
+            gt7_name = ""
+            if db_rel_idx is not None and len(row) > db_rel_idx:
+                gt7_name = row[db_rel_idx].strip()
             if name:
-                result[name.lower()] = (name, team)
-        if not result:
+                driver_map[name.lower()] = (name, team)
+            if gt7_name:
+                gt7_name_map[gt7_name.lower()] = (name, team)
+
+        if not driver_map:
             log.warning("Fahrerliste ist leer! Bitte DB_drvr pruefen (Spalte C ab Zeile 5).")
         else:
-            log.info(f"Fahrerliste geladen: {len(result)} Eintraege")
-        return result
+            log.info(f"Fahrerliste geladen: {len(driver_map)} Eintraege, "
+                     f"{len(gt7_name_map)} GT7-Namen")
+        return driver_map, gt7_name_map
     except Exception as e:
         log.error(f"KRITISCH: Fahrerliste konnte nicht geladen werden: {e}")
-        return {}
+        return {}, {}
 
 # ── Grid-Block Aufloesung ─────────────────────────────────────────────────────
 def read_grid_label(sheet, rennen, block):
@@ -470,7 +502,7 @@ def write_results(sheet, data):
     fahrer_list = data["fahrer"]
     warnings    = []
 
-    driver_map = load_driver_list()
+    driver_map, gt7_name_map = load_driver_list()
 
     block = resolve_block(sheet, rennen, grid_label)
     log.info(f"Rennen {rennen}, Grid '{grid_label}' -> Block {block}")
@@ -500,9 +532,12 @@ def write_results(sheet, data):
             first_pos = pos
 
         # Fahrername und Team aus Fahrerliste (case-insensitive)
+        # Erst Tabellenname (Spalte C), dann GT7-Name (Spalte DB)
         name_key = name_raw.lower()
         if name_key in driver_map:
             name, team = driver_map[name_key]
+        elif name_key in gt7_name_map:
+            name, team = gt7_name_map[name_key]
         else:
             name = name_raw
             team = ""
@@ -827,9 +862,9 @@ async def cmd_cars(channel):
         await status.edit(content=f"Fehler bei !cars: {e}")
 
 
-async def cmd_translate(channel):
+async def cmd_check(channel):
     """
-    !translate - Sucht rote Auto-Zellen im aktuellen Rennen und versucht
+    !check - Sucht rote Auto-Zellen im aktuellen Rennen und versucht
     sie anhand der Car_Translate-Tabelle zu korrigieren.
     Liest Zelleigenschaften via gspread spreadsheet.get() mit includeGridData.
     """
@@ -884,7 +919,7 @@ async def cmd_translate(channel):
                 batch_vals[rowcol_to_a1(abs_row, c_car)] = translated
                 grey_cells_c.append((abs_row, c_car))
                 corrected += 1
-                log.info(f"!translate: '{cell_val}' -> '{translated}' (Z{abs_row})")
+                log.info(f"!check: '{cell_val}' -> '{translated}' (Z{abs_row})")
 
         if corrected == 0:
             await status.edit(content="Keine korrigierbaren roten Auto-Eintraege gefunden.")
@@ -895,11 +930,67 @@ async def cmd_translate(channel):
             for addr, val in batch_vals.items()
         ])
         batch_format_cells(sheet, grey_cells_c, [])
-        await status.edit(content=f"{corrected} Auto(s) korrigiert.")
-        log.info(f"!translate: {corrected} Korrekturen fuer Rennen {rennen}.")
+
+        # ── Fahrer-Spalte pruefen ─────────────────────────────────────────────
+        c_drv      = cs + REL["driver"]
+        drv_range  = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_drv)}"
+        resp_drv   = sheet.spreadsheet.fetch_sheet_metadata(
+            params={"includeGridData": True, "ranges": [f"T!{drv_range}"]}
+        )
+        rows_drv   = (resp_drv.get("sheets", [{}])[0]
+                              .get("data", [{}])[0]
+                              .get("rowData", []))
+
+        _, gt7_name_map = load_driver_list()
+        grey_cells_d    = []
+        batch_drv       = {}
+        corrected_drv   = 0
+
+        for i, row_d in enumerate(rows_drv):
+            abs_row = row_from + i
+            vals    = row_d.get("values", [])
+            if not vals:
+                continue
+            cell  = vals[0]
+            color = (cell.get("effectiveFormat", {})
+                         .get("textFormat", {})
+                         .get("foregroundColor", {}))
+            is_red = (color.get("red", 0) > 0.9
+                      and color.get("green", 0) < 0.1
+                      and color.get("blue", 0) < 0.1)
+            if not is_red:
+                continue
+            cell_val = (cell.get("effectiveValue", {})
+                            .get("stringValue", "")).strip()
+            if not cell_val:
+                continue
+            match = gt7_name_map.get(cell_val.lower())
+            if match:
+                tabellenname, _ = match
+                batch_drv[rowcol_to_a1(abs_row, c_drv)] = tabellenname
+                grey_cells_d.append((abs_row, c_drv))
+                corrected_drv += 1
+                log.info(f"!check drv: '{cell_val}' -> '{tabellenname}' (Z{abs_row})")
+
+        if batch_drv:
+            sheet.batch_update([
+                {"range": addr, "values": [[val]]}
+                for addr, val in batch_drv.items()
+            ])
+            batch_format_cells(sheet, grey_cells_d, [])
+
+        total = corrected + corrected_drv
+        if total == 0:
+            await status.edit(content="Keine korrigierbaren roten Eintraege gefunden.")
+        else:
+            parts = []
+            if corrected:     parts.append(f"{corrected} Auto(s)")
+            if corrected_drv: parts.append(f"{corrected_drv} Fahrer")
+            await status.edit(content=f"{' und '.join(parts)} korrigiert.")
+        log.info(f"!check: {corrected} Autos, {corrected_drv} Fahrer korrigiert (Rennen {rennen}).")
 
     except Exception as e:
-        log.error(f"!translate Fehler: {e}", exc_info=True)
+        log.error(f"!check Fehler: {e}", exc_info=True)
         await status.edit(content=f"Fehler: {type(e).__name__}: {str(e)[:200]}")
 
 
@@ -1180,8 +1271,8 @@ async def handle_command(message):
         elif cmd == "!cars":
             await cmd_cars(channel)
 
-        elif cmd == "!translate":
-            await cmd_translate(channel)
+        elif cmd == "!check":
+            await cmd_check(channel)
 
         elif cmd == "!update":
             load_car_list()
