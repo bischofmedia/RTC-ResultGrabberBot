@@ -505,14 +505,12 @@ def write_results(sheet, data):
         log.info(f"  P{pos} {name} | {auto} | racetime={racetime} "
                  f"laps={laps} fl={beste_runde}")
 
-        r_ps,  c_ps  = get_cell(rennen, block, pos, "position")
         r_drv, c_drv = get_cell(rennen, block, pos, "driver")
         r_tm,  c_tm  = get_cell(rennen, block, pos, "team")
         r_car, c_car = get_cell(rennen, block, pos, "car")
         r_rt,  c_rt  = get_cell(rennen, block, pos, "racetime")
         r_lp,  c_lp  = get_cell(rennen, block, pos, "laps")
 
-        batch[rowcol_to_a1(r_ps,  c_ps)]  = pos
         batch[rowcol_to_a1(r_drv, c_drv)] = name
         batch[rowcol_to_a1(r_tm,  c_tm)]  = team
         batch[rowcol_to_a1(r_car, c_car)] = auto
@@ -555,7 +553,7 @@ def write_results(sheet, data):
     all_cells = set()
     for fahrer in fahrer_list:
         pos = int(fahrer["position"])
-        for field in ("position", "driver", "team", "car", "racetime", "laps"):
+        for field in ("driver", "team", "car", "racetime", "laps"):
             all_cells.add(get_cell(rennen, block, pos, field))
     gl_r, gl_c = get_grid_label_cell(rennen, block)
     all_cells.add((gl_r, gl_c))
@@ -698,6 +696,66 @@ async def update_race_box(channel, rennen):
         log.info(f"Race-Kasten Rennen {rennen} erstellt.")
 
 # ── !sort ─────────────────────────────────────────────────────────────────────
+def build_legend_embed(downloaded):
+    """Baut Legende-Embed aus den tatsaechlich vorhandenen Grids."""
+    grids_present = set(meta["grid"].lower() for _, meta, _ in downloaded)
+
+    grid_line = []
+    if "1" in grids_present:
+        grid_line.append(f"🟡 Grid 1")
+    has_2b = "2b" in grids_present
+    if "2" in grids_present or "2a" in grids_present:
+        label = "Grid 2a" if has_2b else "Grid 2"
+        grid_line.append(f"🔵 {label}")
+    if has_2b:
+        grid_line.append(f"🔴 Grid 2b")
+    if "3" in grids_present:
+        grid_line.append(f"🟢 Grid 3")
+
+    line1 = "  ".join(grid_line)
+    line2 = "🔼 Seite 1    🔽 Seite 2"
+
+    embed = discord.Embed(
+        description=f"-# {line1}\n-# {line2}",
+        color=0x2b2d31
+    )
+    embed.set_footer(text="legend")
+    return embed
+
+def is_legend_embed(message):
+    """Prueft ob eine Nachricht die Legende ist."""
+    if not hasattr(discord_client, "user") or discord_client.user is None:
+        return False
+    if message.author.id != discord_client.user.id:
+        return False
+    for embed in message.embeds:
+        if embed.footer and embed.footer.text == "legend":
+            return True
+    return False
+
+async def update_legend(channel, downloaded):
+    """Erstellt oder aktualisiert die Legende nach den Screenshots."""
+    embed = build_legend_embed(downloaded)
+
+    # Vorhandene Legende suchen
+    last_box_msg, _ = await find_last_race_box(channel)
+    existing = None
+    async for msg in channel.history(limit=200, after=last_box_msg):
+        if is_legend_embed(msg):
+            existing = msg
+            break
+
+    if existing:
+        # Legende ans Ende verschieben: alte loeschen, neue posten
+        try:
+            await existing.delete()
+        except Exception as e:
+            log.warning(f"Konnte Legende nicht loeschen: {e}")
+
+    await channel.send(embed=embed)
+    log.info("Legende aktualisiert.")
+
+
 async def cmd_sort(channel):
     """
     Sortiert Bot-Screenshot-Posts nach Grid/Seite seit dem letzten Rennkasten.
@@ -777,6 +835,7 @@ async def cmd_sort(channel):
         await asyncio.sleep(0.3)
 
     log.info(f"!sort: {len(screenshots)} Screenshots neu sortiert.")
+    await update_legend(channel, downloaded)
 
 
 async def _repost_texts(channel, text_msgs):
@@ -966,6 +1025,7 @@ async def handle_command(message):
             await channel.send("Screenshots sortiert.", delete_after=5)
 
         elif cmd == "!clean":
+            # Bot-Textnachrichten loeschen
             deleted = 0
             async for msg in channel.history(limit=200):
                 if msg.author.id != discord_client.user.id:
@@ -979,7 +1039,29 @@ async def handle_command(message):
                     await msg.delete()
                     deleted += 1
                     await asyncio.sleep(0.5)
+                elif has_embed and is_legend_embed(msg):
+                    continue  # Legende behalten
             log.info(f"!clean: {deleted} Nachrichten geloescht.")
+
+            # Schriftfarbe aller eingetragenen Daten grau setzen
+            # Fuer jedes Rennen das einen Race-Kasten im Channel hat
+            sheet = get_sheet()
+            rennens_found = set()
+            async for msg in channel.history(limit=200):
+                rn = parse_race_number_from_embed(msg)
+                if rn is not None:
+                    rennens_found.add(rn)
+            for rn in rennens_found:
+                cs       = col_start(rn)
+                # Spalten D bis J = cs+2 bis cs+6 (driver, team, car, racetime, laps)
+                col_from = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["driver"])[:-len(str(FIRST_DATA_ROW))]
+                col_to   = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["laps"])[:-len(str(FIRST_DATA_ROW))]
+                # 4 Bloecke x 20 Zeilen = 80 Zeilen ab FIRST_DATA_ROW
+                row_end  = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
+                rng      = f"{col_from}{FIRST_DATA_ROW}:{col_to}{row_end}"
+                sheet.format(rng, {"textFormat": {"foregroundColor": GREY2}})
+                log.info(f"!clean: Rennen {rn} Bereich {rng} grau gefaerbt.")
+            await channel.send(f"Fertig. {deleted} Nachrichten geloescht, {len(rennens_found)} Rennen grau gefaerbt.", delete_after=10)
 
         else:
             return
@@ -1076,7 +1158,7 @@ async def scan_channel():
                             log.info("Original-Post geloescht.")
                         except Exception as e:
                             log.warning(f"Konnte Original-Post nicht loeschen: {e}")
-                        # Kanal sortieren nach fertigem Multipost
+                        # Kanal immer sortieren nach fertigem Post (auch Einzelpost)
                         await cmd_sort(channel)
                     else:
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
