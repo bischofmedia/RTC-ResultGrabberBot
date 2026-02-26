@@ -886,6 +886,29 @@ async def cmd_cars(channel):
         await status.edit(content=f"Fehler bei !cars: {e}")
 
 
+def sheets_api_get_rows(range_str):
+    """Liest Zellwerte und Formatierungen via Sheets REST API.
+    Gibt rowData-Liste zurueck."""
+    import google.auth.transport.requests as gtr
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    # Service-Account-Credentials brauchen kein Refresh - Token wird on-demand generiert
+    creds.refresh(gtr.Request())
+    url = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
+           f"?includeGridData=true&ranges={range_str}"
+           f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
+    resp = requests.get(url, headers={"Authorization": f"Bearer {creds.token}"})
+    resp.raise_for_status()
+    return (resp.json()
+               .get("sheets", [{}])[0]
+               .get("data", [{}])[0]
+               .get("rowData", []))
+
+
 async def cmd_check(channel):
     """
     !check - Sucht rote Auto-Zellen im aktuellen Rennen und versucht
@@ -907,23 +930,7 @@ async def cmd_check(channel):
         car_range = f"{rowcol_to_a1(row_from, c_car)}:{rowcol_to_a1(row_to, c_car)}"
 
         # Zelleigenschaften inkl. Formatierung lesen via Sheets REST API
-        creds   = get_gspread_client().auth
-        import requests as req_lib
-        token   = creds.token if hasattr(creds, "token") else creds.valid
-        # Token auffrischen falls noetig
-        if hasattr(creds, "expired") and creds.expired:
-            import google.auth.transport.requests as gtr
-            creds.refresh(gtr.Request())
-        api_url = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
-                   f"?includeGridData=true&ranges=T!{car_range}"
-                   f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
-        headers  = {"Authorization": f"Bearer {creds.token}"}
-        api_resp = req_lib.get(api_url, headers=headers)
-        api_resp.raise_for_status()
-        rows_data = (api_resp.json()
-                             .get("sheets", [{}])[0]
-                             .get("data", [{}])[0]
-                             .get("rowData", []))
+        rows_data = sheets_api_get_rows(f"T!{car_range}")
 
         corrected    = 0
         batch_vals   = {}
@@ -969,15 +976,7 @@ async def cmd_check(channel):
         # ── Fahrer-Spalte pruefen ─────────────────────────────────────────────
         c_drv      = cs + REL["driver"]
         drv_range  = f"{rowcol_to_a1(row_from, c_drv)}:{rowcol_to_a1(row_to, c_drv)}"
-        api_url_drv = (f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}"
-                        f"?includeGridData=true&ranges=T!{drv_range}"
-                        f"&fields=sheets.data.rowData.values(effectiveValue,effectiveFormat.textFormat.foregroundColor)")
-        api_resp_drv = req_lib.get(api_url_drv, headers=headers)
-        api_resp_drv.raise_for_status()
-        rows_drv     = (api_resp_drv.json()
-                                    .get("sheets", [{}])[0]
-                                    .get("data", [{}])[0]
-                                    .get("rowData", []))
+        rows_drv = sheets_api_get_rows(f"T!{drv_range}")
 
         _, gt7_name_map = load_driver_list()
         grey_cells_d    = []
