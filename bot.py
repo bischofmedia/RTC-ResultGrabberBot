@@ -912,7 +912,7 @@ async def cmd_check(channel):
             if "fahrer nicht in fahrerliste" in txt_lower:
                 if any(name in txt_lower for name in corrected_names):
                     should_delete = True
-            if "nicht in fahrzeugliste" in txt_lower:
+            if "auto" in txt_lower and "nicht erkannt" in txt_lower:
                 if any(car in txt_lower for car in corrected_cars):
                     should_delete = True
             if should_delete:
@@ -1282,6 +1282,10 @@ async def handle_command(message):
         if cmd == "!next":
             _, last_rn = await find_last_race_box(channel)
             next_rn    = (last_rn + 1) if last_rn else 1
+            try:
+                await message.delete()
+            except Exception:
+                pass
             if next_rn > 1:
                 await cmd_clean(channel)
             embed = discord.Embed(
@@ -1297,6 +1301,10 @@ async def handle_command(message):
                 await channel.send("Verwendung: !race <Nummer>")
                 return
             rn = int(parts[1])
+            try:
+                await message.delete()
+            except Exception:
+                pass
             if rn > 1:
                 await cmd_clean(channel)
             embed = discord.Embed(
@@ -1416,7 +1424,8 @@ async def scan_channel():
                 if next_index >= total:
                     continue
 
-                attachment      = attachments[next_index]
+                attachment = attachments[next_index]
+                processing_ids.add(message.id)  # Vor dem Aufruf eintragen - verhindert Doppel-Scan
                 elapsed, success = await process_image(message, attachment)
 
                 if gemini_is_blocked():
