@@ -512,12 +512,14 @@ def analyse_image(image_path):
     return data
 
 # ── Ergebnisse ins Sheet schreiben ────────────────────────────────────────────
-def write_results(sheet, data):
+def write_results(sheet, data, rennen_override=None):
     """
     Schreibt Ergebnisse ins Sheet via Batch-Update.
     Gibt (warnings, rennen, grid_label, first_pos) zurueck.
+    rennen_override: wenn gesetzt, wird dieser Wert statt data["rennen"] verwendet.
     """
-    rennen      = int(data["rennen"])
+    rennen_aus_screenshot = int(data.get("rennen", 0))
+    rennen      = rennen_override if rennen_override is not None else rennen_aus_screenshot
     grid_label  = str(data["grid"]).strip()
     fahrer_list = data["fahrer"]
     warnings    = []
@@ -979,7 +981,7 @@ async def cmd_clean(channel):
                 continue
             await msg.delete()
             deleted += 1
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.6)
     log.info(f"cmd_clean: {deleted} Nachrichten geloescht.")
 
     sheet = get_sheet()
@@ -1045,13 +1047,13 @@ async def cmd_sort(channel):
             await msg.delete()
         except Exception as e:
             log.warning(f"Konnte Bild-Post nicht loeschen: {e}")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.7)
     for msg, _ in text_msgs:
         try:
             await msg.delete()
         except Exception as e:
             log.warning(f"Konnte Textnachricht nicht loeschen: {e}")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.7)
 
     # Bilder in sortierter Reihenfolge neu posten mit Emojis
     for _, meta, img_data in downloaded:
@@ -1175,7 +1177,29 @@ async def process_image(message, attachment):
             raise  # Weiterwerfen damit except-Bloecke greifen
 
         sheet = get_sheet()
-        warnings, rennen, grid_label, first_pos = write_results(sheet, data)
+
+        # Rennnummer aus aktuellem Race-Kasten (nicht aus Screenshot)
+        _, aktuelles_rennen = await find_last_race_box(channel)
+        if aktuelles_rennen is None:
+            aktuelles_rennen = 1
+        rennen_screenshot = int(data.get("rennen", 0))
+        if rennen_screenshot != aktuelles_rennen:
+            log.warning(f"Rennnummer aus Screenshot ({rennen_screenshot}) "
+                        f"weicht von aktuellem Rennen ({aktuelles_rennen}) ab.")
+
+        warnings, rennen, grid_label, first_pos = write_results(
+            sheet, data, rennen_override=aktuelles_rennen
+        )
+
+        # Meldung ausgeben wenn Rennnummer nicht stimmt
+        if rennen_screenshot != aktuelles_rennen and rennen_screenshot != 0:
+            page_tmp = 1 if (first_pos is None or first_pos == 1) else 2
+            grid_str = grid_label.upper() if grid_label.isdigit() else grid_label
+            await channel.send(
+                f"⚠️ Screenshot Grid {grid_str} Seite {page_tmp} prüfen – "
+                f"Rennnummer im Screenshot ({rennen_screenshot}) stimmt nicht "
+                f"mit aktuellem Rennen ({aktuelles_rennen}) überein."
+            )
 
         if status_msg:
             try:
