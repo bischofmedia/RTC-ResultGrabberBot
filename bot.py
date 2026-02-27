@@ -874,7 +874,50 @@ async def cmd_check(channel):
                 {"range": addr, "values": [[val]]}
                 for addr, val in batch_vals.items()
             ])
-            batch_format_cells(sheet, grey_cells, [])
+
+        # Alle Zellen grau faerben die jetzt korrekt sind
+        # (korrigierte + bereits korrekte - beide sollen hellgrau werden)
+        valid_tabellen = {c.lower() for c in car_list}
+        all_grey = list(grey_cells)  # bereits korrigierte
+        for i, row in enumerate(rows):
+            abs_row = row_from + i
+            car_idx = REL["car"] - REL["driver"]
+            drv_val = row[0].strip() if len(row) > 0 else ""
+            car_val = row[car_idx].strip() if len(row) > car_idx else ""
+            # Endname nach Korrektur bestimmen
+            drv_end = next((r[2] for r in report if r[0]=="Fahrer" and r[1]==drv_val and r[3]), drv_val)
+            car_end = next((r[2] for r in report if r[0]=="Auto"   and r[1]==car_val and r[3]), car_val)
+            if drv_val and drv_end.lower() in driver_map:
+                cell = (abs_row, c_drv)
+                if cell not in all_grey:
+                    all_grey.append(cell)
+            if car_val and car_end.lower() in valid_tabellen:
+                cell = (abs_row, c_car)
+                if cell not in all_grey:
+                    all_grey.append(cell)
+        if all_grey:
+            batch_format_cells(sheet, all_grey, [])
+
+        # Alte Warnmeldungen im Channel loeschen wenn Eintrag jetzt korrekt ist
+        corrected_names = {r[1].lower() for r in report if r[3] and r[0] == "Fahrer"}
+        corrected_cars  = {r[1].lower() for r in report if r[3] and r[0] == "Auto"}
+        last_box_msg, _ = await find_last_race_box(channel)
+        async for msg in channel.history(limit=200, after=last_box_msg):
+            if msg.author.id != discord_client.user.id or not msg.content:
+                continue
+            txt_lower = msg.content.lower()
+            should_delete = False
+            if "fahrer nicht in fahrerliste" in txt_lower:
+                if any(name in txt_lower for name in corrected_names):
+                    should_delete = True
+            if "nicht in fahrzeugliste" in txt_lower:
+                if any(car in txt_lower for car in corrected_cars):
+                    should_delete = True
+            if should_delete:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
 
         # Meldung aufbauen
         await status.delete()
@@ -1183,6 +1226,7 @@ async def handle_command(message):
             next_rn    = (last_rn + 1) if last_rn else 1
             if next_rn > 1:
                 await cmd_sort(channel)
+                await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
                 color=0x1a1a2e
@@ -1198,6 +1242,7 @@ async def handle_command(message):
             rn = int(parts[1])
             if rn > 1:
                 await cmd_sort(channel)
+                await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
                 color=0x1a1a2e
