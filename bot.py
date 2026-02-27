@@ -1328,7 +1328,6 @@ async def handle_command(message):
 
         elif cmd == "!clean":
             await cmd_clean(channel)
-            await channel.send("Fertig.", delete_after=10)
 
         else:
             return
