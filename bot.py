@@ -963,6 +963,41 @@ async def update_legend(channel, downloaded):
     log.info("Legende aktualisiert.")
 
 
+async def cmd_clean(channel):
+    """Loescht Bot-Textnachrichten und faerbt Sheet-Daten grau."""
+    deleted = 0
+    async for msg in channel.history(limit=200):
+        if msg.author.id != discord_client.user.id:
+            continue
+        has_embed = len(msg.embeds) > 0
+        has_image = any(
+            a.content_type and a.content_type.startswith("image/")
+            for a in msg.attachments
+        )
+        if not has_embed and not has_image:
+            if is_legend_embed(msg):
+                continue
+            await msg.delete()
+            deleted += 1
+            await asyncio.sleep(0.3)
+    log.info(f"cmd_clean: {deleted} Nachrichten geloescht.")
+
+    sheet = get_sheet()
+    rennens_found = set()
+    async for msg in channel.history(limit=200):
+        rn = parse_race_number_from_embed(msg)
+        if rn is not None:
+            rennens_found.add(rn)
+    for rn in rennens_found:
+        cs       = col_start(rn)
+        col_from = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["driver"])[:-len(str(FIRST_DATA_ROW))]
+        col_to   = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["laps"])[:-len(str(FIRST_DATA_ROW))]
+        row_end  = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
+        rng      = f"{col_from}{FIRST_DATA_ROW}:{col_to}{row_end}"
+        sheet.format(rng, {"textFormat": {"foregroundColor": GREY2}})
+    log.info(f"cmd_clean: {len(rennens_found)} Rennen grau gefaerbt.")
+
+
 async def cmd_sort(channel):
     """
     Sortiert Bot-Screenshot-Posts nach Grid/Seite seit dem letzten Rennkasten.
@@ -1225,7 +1260,6 @@ async def handle_command(message):
             _, last_rn = await find_last_race_box(channel)
             next_rn    = (last_rn + 1) if last_rn else 1
             if next_rn > 1:
-                await cmd_sort(channel)
                 await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
@@ -1241,7 +1275,6 @@ async def handle_command(message):
                 return
             rn = int(parts[1])
             if rn > 1:
-                await cmd_sort(channel)
                 await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
@@ -1271,43 +1304,8 @@ async def handle_command(message):
             await channel.send("Screenshots sortiert.", delete_after=5)
 
         elif cmd == "!clean":
-            # Bot-Textnachrichten loeschen
-            deleted = 0
-            async for msg in channel.history(limit=200):
-                if msg.author.id != discord_client.user.id:
-                    continue
-                has_embed = len(msg.embeds) > 0
-                has_image = any(
-                    a.content_type and a.content_type.startswith("image/")
-                    for a in msg.attachments
-                )
-                if not has_embed and not has_image:
-                    await msg.delete()
-                    deleted += 1
-                    await asyncio.sleep(0.5)
-                elif has_embed and is_legend_embed(msg):
-                    continue  # Legende behalten
-            log.info(f"!clean: {deleted} Nachrichten geloescht.")
-
-            # Schriftfarbe aller eingetragenen Daten grau setzen
-            # Fuer jedes Rennen das einen Race-Kasten im Channel hat
-            sheet = get_sheet()
-            rennens_found = set()
-            async for msg in channel.history(limit=200):
-                rn = parse_race_number_from_embed(msg)
-                if rn is not None:
-                    rennens_found.add(rn)
-            for rn in rennens_found:
-                cs       = col_start(rn)
-                # Spalten D bis J = cs+2 bis cs+6 (driver, team, car, racetime, laps)
-                col_from = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["driver"])[:-len(str(FIRST_DATA_ROW))]
-                col_to   = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["laps"])[:-len(str(FIRST_DATA_ROW))]
-                # 4 Bloecke x 20 Zeilen = 80 Zeilen ab FIRST_DATA_ROW
-                row_end  = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
-                rng      = f"{col_from}{FIRST_DATA_ROW}:{col_to}{row_end}"
-                sheet.format(rng, {"textFormat": {"foregroundColor": GREY2}})
-                log.info(f"!clean: Rennen {rn} Bereich {rng} grau gefaerbt.")
-            await channel.send(f"Fertig. {deleted} Nachrichten geloescht, {len(rennens_found)} Rennen grau gefaerbt.", delete_after=10)
+            await cmd_clean(channel)
+            await channel.send("Fertig.", delete_after=10)
 
         else:
             return
