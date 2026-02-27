@@ -28,6 +28,8 @@ GOOGLE_SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS     = os.environ["GOOGLE_CREDENTIALS"]
 GEMINI_2ND_RUN         = int(os.environ.get("GEMINI_2ND_RUN", "0"))
 GEMINI_BACKOFF_MINUTES = int(os.environ.get("GEMINI_BACKOFF_MINUTES", "60"))
+SPECIAL_EVENT_RAW  = os.environ.get("SPECIAL_EVENT", "")
+SPECIAL_EVENTS     = [s.strip().lower() for s in SPECIAL_EVENT_RAW.split(";") if s.strip()]
 
 POLL_INTERVAL = 15
 DONE_EMOJI    = "\u2705"
@@ -359,7 +361,8 @@ def build_extract_prompt():
         "Format:\n"
         "{\n"
         '  "rennen": <Zahl>,\n'
-        '  "grid": "<1, 2, 2a, 2b oder 3>",\n'
+        '  "grid": "<1, 2, 2a, 2b oder 3 - oder null wenn nicht erkennbar>",\n'
+        '  "kopfzeile": "<vollstaendiger Text der Kopfzeile exakt wie im Bild>",\n'
         '  "fahrer": [\n'
         "    {\n"
         '      "position": <Zahl>,\n'
@@ -372,6 +375,8 @@ def build_extract_prompt():
         "}\n\n"
         "Hinweise:\n"
         "- rennen und grid stehen im Titel\n"
+        "- Wenn keine Gridnummer erkennbar ist, setze grid auf null\n"
+        "- kopfzeile: gesamter Titeltext der Ergebnisliste\n"
         "- Erstplatzierter hat absolute Rennzeit (z.B. 50:28,752)\n"
         "- Alle anderen haben Delta (z.B. +06,425)\n"
         "- Ueberrundete Fahrer: 'X Runden' oder 'X Laps'\n"
@@ -488,6 +493,14 @@ def analyse_image(image_path):
     data   = call_gemini(img, prompt)
     log.info(f"Durchlauf 1: Rennen {data.get('rennen')}, Grid {data.get('grid')}, "
              f"{len(data.get('fahrer', []))} Fahrer")
+
+    # Special Event: wenn grid null/leer und Kopfzeile enthaelt bekanntes Event -> Grid 1
+    grid_val = data.get("grid")
+    if not grid_val or str(grid_val).strip().lower() in ("null", "none", ""):
+        kopfzeile = data.get("kopfzeile", "").lower()
+        if SPECIAL_EVENTS and any(ev in kopfzeile for ev in SPECIAL_EVENTS):
+            data["grid"] = "1"
+            log.info(f"Special Event erkannt in Kopfzeile '{kopfzeile}' -> Grid 1")
 
     if GEMINI_2ND_RUN == 0:
         return data
@@ -1243,6 +1256,16 @@ async def process_image(message, attachment):
     except GeminiQuotaError as qe:
         retry_time = berlin_time_str(gemini_blocked_until) if gemini_blocked_until else "?"
         text = f"⏳ Gemini-Limit erreicht, versuche es wieder um {retry_time} Uhr."
+        # Alte Quota-Nachrichten loeschen (koennen sich bei mehrfachem Limit anhaeufen)
+        async for old_qmsg in channel.history(limit=50):
+            if (old_qmsg.author.id == discord_client.user.id
+                    and old_qmsg.content
+                    and "Gemini-Limit erreicht" in old_qmsg.content
+                    and old_qmsg != quota_msg):
+                try:
+                    await old_qmsg.delete()
+                except Exception:
+                    pass
         # status_msg in Limit-Nachricht umwandeln statt neue zu posten
         try:
             if status_msg:
