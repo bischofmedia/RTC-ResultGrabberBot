@@ -966,9 +966,13 @@ async def update_legend(channel, downloaded):
 
 
 async def cmd_clean(channel):
-    """Loescht Bot-Textnachrichten und faerbt Sheet-Daten grau."""
+    """Loescht Bot-Textnachrichten seit dem letzten Race-Kasten.
+    Faerbt nur das aktuelle Rennen grau - versiegelte Rennen werden nicht angeruehrt."""
+    last_box_msg, aktuelles_rennen = await find_last_race_box(channel)
+
+    # Nur Nachrichten NACH dem letzten Race-Kasten loeschen
     deleted = 0
-    async for msg in channel.history(limit=200):
+    async for msg in channel.history(limit=200, after=last_box_msg):
         if msg.author.id != discord_client.user.id:
             continue
         has_embed = len(msg.embeds) > 0
@@ -976,28 +980,22 @@ async def cmd_clean(channel):
             a.content_type and a.content_type.startswith("image/")
             for a in msg.attachments
         )
-        if not has_embed and not has_image:
-            if is_legend_embed(msg):
-                continue
+        if not has_embed and not has_image and not is_legend_embed(msg):
             await msg.delete()
             deleted += 1
             await asyncio.sleep(0.6)
     log.info(f"cmd_clean: {deleted} Nachrichten geloescht.")
 
-    sheet = get_sheet()
-    rennens_found = set()
-    async for msg in channel.history(limit=200):
-        rn = parse_race_number_from_embed(msg)
-        if rn is not None:
-            rennens_found.add(rn)
-    for rn in rennens_found:
-        cs       = col_start(rn)
+    # Nur aktuelles Rennen grau faerben
+    if aktuelles_rennen is not None:
+        sheet    = get_sheet()
+        cs       = col_start(aktuelles_rennen)
         col_from = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["driver"])[:-len(str(FIRST_DATA_ROW))]
         col_to   = rowcol_to_a1(FIRST_DATA_ROW, cs + REL["laps"])[:-len(str(FIRST_DATA_ROW))]
         row_end  = FIRST_DATA_ROW + 4 * ROW_OFFSET_PER_GRID - 1
         rng      = f"{col_from}{FIRST_DATA_ROW}:{col_to}{row_end}"
         sheet.format(rng, {"textFormat": {"foregroundColor": GREY2}})
-    log.info(f"cmd_clean: {len(rennens_found)} Rennen grau gefaerbt.")
+        log.info(f"cmd_clean: Rennen {aktuelles_rennen} grau gefaerbt.")
 
 
 async def cmd_sort(channel):
@@ -1214,9 +1212,10 @@ async def process_image(message, attachment):
         for w in warnings:
             await channel.send(w)
 
-        # Duplikat-Check: existiert bereits ein Bot-Post mit gleichen Emojis?
+        # Duplikat-Check: nur nach letztem Race-Kasten suchen (versiegelte Rennen nicht anfassen)
         g_emoji, p_emoji = get_marker_emojis(grid_label, page)
-        async for old_msg in channel.history(limit=100):
+        last_box_for_dup, _ = await find_last_race_box(channel)
+        async for old_msg in channel.history(limit=100, after=last_box_for_dup):
             old_meta = parse_screenshot_meta_from_msg(old_msg)
             if (old_meta and old_meta["grid"] == grid_label
                     and old_meta["page"] == page):
