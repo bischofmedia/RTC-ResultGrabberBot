@@ -579,8 +579,8 @@ def write_results(sheet, data, rennen_override=None):
             r_drv, c_drv = get_cell(rennen, block, pos, "driver")
             red_cells.append((r_drv, c_drv))
             warnings.append(
-                f"Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name_raw}: "
-                f"Fahrer nicht in Fahrerliste"
+                (2, f"👤 Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name_raw}: "
+                f"Fahrer nicht in Fahrerliste")
             )
 
         racetime, laps = clean_time(zeit)
@@ -603,19 +603,19 @@ def write_results(sheet, data, rennen_override=None):
         if auto_unbekannt:
             red_cells.append((r_car, c_car))
             warnings.append(
-                f"Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name}: "
-                f"Auto '{auto}' nicht erkannt - bitte manuell pruefen"
+                (3, f"🚗 Rennen {rennen}, Grid {grid_label}, Pos {pos}, {name}: "
+                f"Auto '{auto}' nicht erkannt - bitte manuell pruefen")
             )
 
         if pos in delta_errors:
             red_cells.append((r_rt, c_rt))
             warnings.append(
-                f"Grid {grid_label}, Pos {pos}, {name}: Zeit ist zu pruefen"
+                (4, f"⏱️ Grid {grid_label}, Pos {pos}, {name}: Zeit ist zu pruefen")
             )
 
         if laps is not None:
             warnings.append(
-                f"Grid {grid_label}, Pos {pos}, {name}: Zeit muss manuell eingetragen werden."
+                (5, f"✍️ Grid {grid_label}, Pos {pos}, {name}: Zeit muss manuell eingetragen werden.")
             )
 
         if beste_runde:
@@ -1049,12 +1049,10 @@ async def cmd_sort(channel):
     # Bilder herunterladen bevor wir loeschen
     downloaded = []
     for msg, meta, img_att in screenshots:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(img_att.url) as resp:
-                if resp.status != 200:
-                    log.warning(f"Bild-Download fehlgeschlagen ({resp.status}): {img_att.url}")
-                    continue
-                img_data = await resp.read()
+        import io
+        buf = io.BytesIO()
+        await img_att.save(buf)
+        img_data = buf.getvalue()
         downloaded.append((msg, meta, img_data))
 
     # Alle alten Bild-Posts und Textnachrichten loeschen
@@ -1163,16 +1161,7 @@ async def process_image(message, attachment):
     global quota_msg  # hier deklarieren, vor allen try/except-Bloecken
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(attachment.url) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"Bild-Download fehlgeschlagen: HTTP {resp.status}")
-                ct = resp.headers.get("Content-Type", "")
-                if "image" not in ct:
-                    raise RuntimeError(f"Unerwarteter Content-Type: {ct[:100]}")
-                img_data = await resp.read()
-        with open(tmp_path, "wb") as f:
-            f.write(img_data)
+        await attachment.save(tmp_path)
 
         processing_ids.add(message.id)  # Verhindert Doppel-Scan waehrend Verarbeitung
 
@@ -1218,11 +1207,11 @@ async def process_image(message, attachment):
         if rennen_screenshot != aktuelles_rennen and rennen_screenshot != 0:
             page_tmp = 1 if (first_pos is None or first_pos == 1) else 2
             grid_str = grid_label.upper() if grid_label.isdigit() else grid_label
-            await channel.send(
+            warnings.insert(0, (1,
                 f"⚠️ Screenshot Grid {grid_str} Seite {page_tmp} prüfen – "
                 f"Rennnummer im Screenshot ({rennen_screenshot}) stimmt nicht "
                 f"mit aktuellem Rennen ({aktuelles_rennen}) überein."
-            )
+            ))
 
         if status_msg:
             try:
@@ -1234,7 +1223,12 @@ async def process_image(message, attachment):
         # Seite bestimmen: P1 = Seite 1, sonst Seite 2
         page = 1 if (first_pos is None or first_pos == 1) else 2
 
-        for w in warnings:
+        # Meldungen nach Prioritaet sortieren und posten
+        warnings_sorted = sorted(
+            [w if isinstance(w, tuple) else (9, w) for w in warnings],
+            key=lambda x: x[0]
+        )
+        for _, w in warnings_sorted:
             await channel.send(w)
 
         # Duplikat-Check: nur nach letztem Race-Kasten suchen (versiegelte Rennen nicht anfassen)
