@@ -154,11 +154,10 @@ def get_grid_label_cell(rennen, block):
 
 # ── Google Sheets Client ──────────────────────────────────────────────────────
 def get_gspread_client():
-    import os
     creds_value = GOOGLE_CREDENTIALS
     if os.path.isfile(creds_value):
-    with open(creds_value) as f:
-        creds_dict = json.load(f)
+        with open(creds_value) as f:
+            creds_dict = json.load(f)
     else:
         creds_dict = json.loads(creds_value)
     scopes = [
@@ -353,7 +352,7 @@ def update_fastest_lap(sheet, rennen, new_driver, new_time_int):
 genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 gemini_model      = genai.GenerativeModel(GEMINI_MODEL)
-GENERATION_CONFIG = genai.GenerationConfig(temperature=0)
+GENERATION_CONFIG = genai.GenerationConfig(temperature=0, max_output_tokens=8192)
 
 def build_extract_prompt():
     """Erstellt den Extraktions-Prompt. Fahrzeugname wird exakt aus Bild gelesen."""
