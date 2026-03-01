@@ -154,7 +154,13 @@ def get_grid_label_cell(rennen, block):
 
 # ── Google Sheets Client ──────────────────────────────────────────────────────
 def get_gspread_client():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    import os
+    creds_value = GOOGLE_CREDENTIALS
+    if os.path.isfile(creds_value):
+    with open(creds_value) as f:
+        creds_dict = json.load(f)
+    else:
+        creds_dict = json.loads(creds_value)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
