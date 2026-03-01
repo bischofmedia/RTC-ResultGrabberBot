@@ -447,6 +447,10 @@ def berlin_time_str(dt):
         dt_berlin = dt + timedelta(hours=2)
     return dt_berlin.strftime("%H:%M")
 
+async def download_attachment(attachment):
+    """Laedt Attachment ueber den authentifizierten Discord-HTTP-Client herunter."""
+    return await discord_client.http.get_from_cdn(attachment.url)
+
 async def clear_quota_msg(channel):
     """Loescht die Quota-Warnmeldung wenn Sperre aufgehoben."""
     global quota_msg
@@ -1049,10 +1053,7 @@ async def cmd_sort(channel):
     # Bilder herunterladen bevor wir loeschen
     downloaded = []
     for msg, meta, img_att in screenshots:
-        import io
-        buf = io.BytesIO()
-        await img_att.save(buf)
-        img_data = buf.getvalue()
+        img_data = await download_attachment(img_att)
         downloaded.append((msg, meta, img_data))
 
     # Alle alten Bild-Posts und Textnachrichten loeschen
@@ -1161,7 +1162,9 @@ async def process_image(message, attachment):
     global quota_msg  # hier deklarieren, vor allen try/except-Bloecken
 
     try:
-        await attachment.save(tmp_path)
+        img_data = await download_attachment(attachment)
+        with open(tmp_path, "wb") as f:
+            f.write(img_data)
 
         processing_ids.add(message.id)  # Verhindert Doppel-Scan waehrend Verarbeitung
 
