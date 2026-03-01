@@ -1049,7 +1049,12 @@ async def cmd_sort(channel):
     # Bilder herunterladen bevor wir loeschen
     downloaded = []
     for msg, meta, img_att in screenshots:
-        img_data = requests.get(img_att.url).content
+        async with aiohttp.ClientSession() as session:
+            async with session.get(img_att.url) as resp:
+                if resp.status != 200:
+                    log.warning(f"Bild-Download fehlgeschlagen ({resp.status}): {img_att.url}")
+                    continue
+                img_data = await resp.read()
         downloaded.append((msg, meta, img_data))
 
     # Alle alten Bild-Posts und Textnachrichten loeschen
@@ -1158,7 +1163,14 @@ async def process_image(message, attachment):
     global quota_msg  # hier deklarieren, vor allen try/except-Bloecken
 
     try:
-        img_data = requests.get(attachment.url).content
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Bild-Download fehlgeschlagen: HTTP {resp.status}")
+                ct = resp.headers.get("Content-Type", "")
+                if "image" not in ct:
+                    raise RuntimeError(f"Unerwarteter Content-Type: {ct[:100]}")
+                img_data = await resp.read()
         with open(tmp_path, "wb") as f:
             f.write(img_data)
 
