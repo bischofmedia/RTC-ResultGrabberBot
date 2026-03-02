@@ -407,7 +407,20 @@ def call_gemini(img, prompt):
             [prompt, img],
             generation_config=GENERATION_CONFIG
         )
-        text = response.text.strip()
+        # Leere Antwort abfangen (z.B. Safety-Filter oder blockierter Content)
+        try:
+            text = response.text
+        except Exception:
+            # response.text wirft Exception wenn Antwort geblockt wurde
+            reason = ""
+            try:
+                reason = str(response.prompt_feedback)
+            except Exception:
+                pass
+            raise RuntimeError(f"Gemini hat keine Antwort geliefert (geblockt?). {reason}")
+        text = text.strip()
+        if not text:
+            raise RuntimeError("Gemini hat leere Antwort zurueckgegeben.")
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$",     "", text)
         return json.loads(text)
