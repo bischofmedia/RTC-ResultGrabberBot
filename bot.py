@@ -193,20 +193,30 @@ def load_car_list():
         car_list = []
 
     # Car_Translate laden: Spalte A = Tabellenname, Spalte B = Spielname
-    try:
-        wb    = get_workbook()
-        sheet = wb.worksheet("Car_Translate")
-        rows  = sheet.get("A2:B1000")  # Zeile 1 = Ueberschrift
-        car_translate_map = {}
-        for row in rows:
-            tabellenname = row[0].strip() if len(row) > 0 else ""
-            spielname    = row[1].strip() if len(row) > 1 else ""
-            if tabellenname and spielname:
-                car_translate_map[spielname.lower()] = tabellenname
-        log.info(f"Car_Translate geladen: {len(car_translate_map)} Eintraege")
-    except Exception as e:
-        log.warning(f"Car_Translate nicht geladen (noch nicht angelegt?): {e}")
-        car_translate_map = {}
+    for versuch in range(1, 6):
+        try:
+            wb    = get_workbook()
+            sheet = wb.worksheet("Car_Translate")
+            rows  = sheet.get("A2:B1000")  # Zeile 1 = Ueberschrift
+            car_translate_map = {}
+            for row in rows:
+                tabellenname = row[0].strip() if len(row) > 0 else ""
+                spielname    = row[1].strip() if len(row) > 1 else ""
+                if tabellenname and spielname:
+                    car_translate_map[spielname.lower()] = tabellenname
+            log.info(f"Car_Translate geladen: {len(car_translate_map)} Eintraege")
+            break
+        except Exception as e:
+            if "Car_Translate" in str(e) or "worksheet" in str(e).lower() or "not found" in str(e).lower():
+                log.info("Car_Translate Tabellenblatt nicht vorhanden - wird ignoriert.")
+                car_translate_map = {}
+                break
+            if versuch < 5:
+                log.warning(f"Car_Translate Versuch {versuch}/5 fehlgeschlagen: {e} - warte 2s")
+                import time; time.sleep(2)
+            else:
+                log.error(f"Car_Translate konnte nach 5 Versuchen nicht geladen werden: {e}")
+                car_translate_map = {}
 
 def load_driver_list():
     """Laedt Fahrerliste aus DB_drvr.
@@ -407,20 +417,7 @@ def call_gemini(img, prompt):
             [prompt, img],
             generation_config=GENERATION_CONFIG
         )
-        # Leere Antwort abfangen (z.B. Safety-Filter oder blockierter Content)
-        try:
-            text = response.text
-        except Exception:
-            # response.text wirft Exception wenn Antwort geblockt wurde
-            reason = ""
-            try:
-                reason = str(response.prompt_feedback)
-            except Exception:
-                pass
-            raise RuntimeError(f"Gemini hat keine Antwort geliefert (geblockt?). {reason}")
-        text = text.strip()
-        if not text:
-            raise RuntimeError("Gemini hat leere Antwort zurueckgegeben.")
+        text = response.text.strip()
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$",     "", text)
         return json.loads(text)
@@ -1337,6 +1334,7 @@ async def handle_command(message):
             except Exception:
                 pass
             if next_rn > 1:
+                await cmd_sort(channel)
                 await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
@@ -1356,6 +1354,7 @@ async def handle_command(message):
             except Exception:
                 pass
             if rn > 1:
+                await cmd_sort(channel)
                 await cmd_clean(channel)
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
@@ -1475,6 +1474,8 @@ async def scan_channel():
                     continue
 
                 attachment = attachments[next_index]
+                if message.id in processing_ids:
+                    continue  # Doppelcheck direkt vor dem Aufruf
                 processing_ids.add(message.id)  # Vor dem Aufruf eintragen - verhindert Doppel-Scan
                 elapsed, success = await process_image(message, attachment)
 
@@ -1491,8 +1492,7 @@ async def scan_channel():
                             log.info("Original-Post geloescht.")
                         except Exception as e:
                             log.warning(f"Konnte Original-Post nicht loeschen: {e}")
-                        # Kanal immer sortieren nach fertigem Post (auch Einzelpost)
-                        await cmd_sort(channel)
+                        # Kein Auto-Sort - wird manuell per !sort ausgeloest
                     else:
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
                         log.info(f"Bild {new_count}/{total} verarbeitet.")
