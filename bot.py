@@ -364,27 +364,27 @@ GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 gemini_model      = genai.GenerativeModel(GEMINI_MODEL)
 GENERATION_CONFIG = genai.GenerationConfig(temperature=0, max_output_tokens=8192)
 
-def load_name_examples():
-    """Laedt Fahrernamen-Beispiele aus names.txt falls vorhanden."""
-    try:
-        path = os.path.join(os.path.dirname(__file__), "names.txt")
-        if os.path.isfile(path):
-            with open(path, encoding="utf-8") as f:
-                names = [l.strip() for l in f if l.strip()]
-            if names:
-                return ", ".join(f"'{n}'" for n in names[:10])
-    except Exception as e:
-        log.warning(f"names.txt nicht geladen: {e}")
-    return "'Bismark', 'XxChillerHDxX95'"  # Fallback
-
 def build_extract_prompt():
-    """Erstellt den Extraktions-Prompt. Fahrzeugname wird exakt aus Bild gelesen."""
-    name_examples = load_name_examples()
+    """Erstellt den Extraktions-Prompt mit aktueller Fahrerliste."""
+    # Fahrernamen aus driver_map fuer Prompt verwenden
+    if driver_map:
+        names = sorted(driver_map.keys())
+        # Originalnamen (nicht lowercase) aus den Werten holen
+        name_list = [driver_map[k][0] for k in names]
+        names_str = ", ".join(f"'{n}'" for n in name_list)
+        name_section = (
+            "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
+            f"Bekannte Fahrer (exakt so schreiben): {names_str}\n"
+            "Unbekannte Namen ebenfalls unveraendert uebernehmen.\n\n"
+        )
+    else:
+        name_section = (
+            "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n\n"
+        )
     return (
         "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
         "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
-        "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
-        f"Beispiel: {name_examples} - alle exakt so lassen wie im Bild.\n\n"
+        + name_section +
         "FAHRZEUGNAMEN: Lies den Namen exakt so wie er im Bild steht.\n"
         "Kopiere unveraendert, inklusive Jahreszahl, Sonderzeichen und Klammern.\n\n"
         "Format:\n"
