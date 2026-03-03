@@ -364,13 +364,27 @@ GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 gemini_model      = genai.GenerativeModel(GEMINI_MODEL)
 GENERATION_CONFIG = genai.GenerationConfig(temperature=0, max_output_tokens=8192)
 
+def load_name_examples():
+    """Laedt Fahrernamen-Beispiele aus names.txt falls vorhanden."""
+    try:
+        path = os.path.join(os.path.dirname(__file__), "names.txt")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                names = [l.strip() for l in f if l.strip()]
+            if names:
+                return ", ".join(f"'{n}'" for n in names[:10])
+    except Exception as e:
+        log.warning(f"names.txt nicht geladen: {e}")
+    return "'Bismark', 'XxChillerHDxX95'"  # Fallback
+
 def build_extract_prompt():
     """Erstellt den Extraktions-Prompt. Fahrzeugname wird exakt aus Bild gelesen."""
+    name_examples = load_name_examples()
     return (
         "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
         "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
         "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
-        "Beispiel: 'Bismark' bleibt 'Bismark', 'XxChillerHDxX95' bleibt exakt so.\n\n"
+        f"Beispiel: {name_examples} - alle exakt so lassen wie im Bild.\n\n"
         "FAHRZEUGNAMEN: Lies den Namen exakt so wie er im Bild steht.\n"
         "Kopiere unveraendert, inklusive Jahreszahl, Sonderzeichen und Klammern.\n\n"
         "Format:\n"
@@ -1505,6 +1519,7 @@ async def scan_channel():
                 if remaining > 0:
                     log.info(f"Warte {remaining:.1f}s")
                     await asyncio.sleep(remaining)
+                continue  # Kein zusaetzliches Sleep am Ende
 
         except Exception as e:
             log.error(f"Scan-Fehler: {e}", exc_info=True)
