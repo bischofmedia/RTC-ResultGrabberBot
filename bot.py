@@ -1044,6 +1044,24 @@ async def cmd_clean(channel):
         log.info(f"cmd_clean: Rennen {aktuelles_rennen} grau gefaerbt.")
 
 
+async def is_channel_sorted(channel):
+    """Prueft ob Bot-Screenshots seit dem letzten Rennkasten bereits sortiert sind."""
+    last_box_msg, _ = await find_last_race_box(channel)
+    current_order = []
+    async for msg in channel.history(limit=200, after=last_box_msg):
+        if msg.author.id != discord_client.user.id:
+            continue
+        has_image = any(a.content_type and a.content_type.startswith("image/")
+                        for a in msg.attachments)
+        if has_image:
+            meta = parse_screenshot_meta_from_msg(msg)
+            if meta:
+                current_order.append(screenshot_sort_key(meta))
+    if not current_order:
+        return True  # Nichts da -> nichts zu sortieren
+    expected = sorted(current_order)
+    return current_order == expected
+
 async def cmd_sort(channel):
     """
     Sortiert Bot-Screenshot-Posts nach Grid/Seite seit dem letzten Rennkasten.
@@ -1348,8 +1366,12 @@ async def handle_command(message):
             except Exception:
                 pass
             if next_rn > 1:
-                await cmd_sort(channel)
                 await cmd_clean(channel)
+                if not await is_channel_sorted(channel):
+                    log.info("!next: Channel unsortiert, starte !sort")
+                    await cmd_sort(channel)
+                else:
+                    log.info("!next: Channel bereits sortiert, kein !sort noetig")
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
                 color=0x1a1a2e
@@ -1368,8 +1390,12 @@ async def handle_command(message):
             except Exception:
                 pass
             if rn > 1:
-                await cmd_sort(channel)
                 await cmd_clean(channel)
+                if not await is_channel_sorted(channel):
+                    log.info("!race: Channel unsortiert, starte !sort")
+                    await cmd_sort(channel)
+                else:
+                    log.info("!race: Channel bereits sortiert, kein !sort noetig")
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
                 color=0x1a1a2e
