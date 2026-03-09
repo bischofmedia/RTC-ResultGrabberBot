@@ -378,18 +378,23 @@ def build_extract_prompt():
         name_section = (
             "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
             f"Bekannte Fahrer (exakt so schreiben): {names_str}\n"
-            "Unbekannte Namen ebenfalls unveraendert uebernehmen.\n\n"
+            "Unbekannte Namen ebenfalls unveraendert uebernehmen.\n"
+            "WICHTIG: Niemals - durch _ ersetzen oder umgekehrt.\n"
+            "WICHTIG: Apostrophe immer als geraden Apostroph ' schreiben, nie als \u2019 oder `.\n\n"
         )
     else:
         name_section = (
-            "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n\n"
+            "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
+            "WICHTIG: Niemals - durch _ ersetzen oder umgekehrt.\n"
+            "WICHTIG: Apostrophe immer als geraden Apostroph ' schreiben, nie als ' oder `.\n\n"
         )
     return (
         "Analysiere diesen Gran Turismo Ergebnisscreen und extrahiere die Daten als JSON.\n\n"
         "Gib NUR gueltiges JSON zurueck, kein Markdown, keine Erklaerungen.\n\n"
         + name_section +
         "FAHRZEUGNAMEN: Lies den Namen exakt so wie er im Bild steht.\n"
-        "Kopiere unveraendert, inklusive Jahreszahl, Sonderzeichen und Klammern.\n\n"
+        "Kopiere unveraendert, inklusive Jahreszahl, Sonderzeichen und Klammern.\n"
+        "WICHTIG: Apostrophe immer als geraden Apostroph ' schreiben, nie als ' oder `.\n\n"
         "Format:\n"
         "{\n"
         '  "rennen": <Zahl>,\n'
