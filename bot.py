@@ -437,7 +437,13 @@ def call_gemini(img, prompt):
         text = response.text.strip()
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$",     "", text)
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Gemini hat manchmal leicht fehlerhaftes JSON - Reparaturversuch
+            log.warning("JSON-Parsing fehlgeschlagen, versuche Reparatur...")
+            text_fixed = re.sub(r",\s*([}\]])", r"\1", text)
+            return json.loads(text_fixed)
     except ResourceExhausted as e:
         err_str = str(e).lower()
         if "per day" in err_str or "daily" in err_str or "quota_exceeded" in err_str:
