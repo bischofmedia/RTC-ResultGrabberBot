@@ -34,6 +34,7 @@ SPECIAL_EVENTS     = [s.strip().lower() for s in SPECIAL_EVENT_RAW.split(";") if
 POLL_INTERVAL = 15
 DONE_EMOJI    = "\u2705"
 ERROR_EMOJI   = "\u274c"
+MANUAL_EMOJI  = "\u270d\ufe0f"  # ✍️ manuell
 
 NUMBER_EMOJIS = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3",
                  "5\ufe0f\u20e3", "6\ufe0f\u20e3", "7\ufe0f\u20e3", "8\ufe0f\u20e3",
@@ -48,6 +49,8 @@ car_list = []
 # Uebersetzungstabelle: {spielname_lower: tabellenname}
 # Spielname = Spalte B, Tabellenname = Spalte A in Car_Translate
 car_translate_map: dict = {}
+driver_map:        dict = {}
+gt7_name_map:      dict = {}
 
 class GeminiQuotaError(Exception):
     pass
@@ -1026,7 +1029,12 @@ async def cmd_clean(channel):
             a.content_type and a.content_type.startswith("image/")
             for a in msg.attachments
         )
-        if not has_embed and not has_image and not is_legend_embed(msg):
+        # Zitat-Posts mit Grid/Retry-Befehlen loeschen (koennen stehenbleiben)
+        is_reply_cmd = (
+            msg.reference is not None and
+            re.match(r"(grid\s+\w+|retry)", msg.content.strip(), re.IGNORECASE)
+        )
+        if (not has_embed and not has_image and not is_legend_embed(msg)) or is_reply_cmd:
             await msg.delete()
             deleted += 1
             await asyncio.sleep(0.6)
@@ -1161,7 +1169,7 @@ async def already_processed(message):
     except Exception:
         return True
     for reaction in fresh.reactions:
-        if str(reaction.emoji) in (DONE_EMOJI, ERROR_EMOJI):
+        if str(reaction.emoji) in (DONE_EMOJI, ERROR_EMOJI, MANUAL_EMOJI):
             async for user in reaction.users():
                 if user.id == discord_client.user.id:
                     return True
@@ -1176,6 +1184,23 @@ async def get_processed_count(message):
                 if user.id == discord_client.user.id:
                     return NUMBER_EMOJIS.index(emoji_str) + 1
     return 0
+
+async def remove_all_bot_reactions(message):
+    """Entfernt alle Bot-Reaktionen von einer Nachricht (fuer Retry)."""
+    try:
+        fresh = await message.channel.fetch_message(message.id)
+    except Exception:
+        return
+    all_emojis = (set(NUMBER_EMOJIS) | ALL_MARKER_EMOJIS |
+                  {DONE_EMOJI, ERROR_EMOJI, MANUAL_EMOJI})
+    for reaction in fresh.reactions:
+        if str(reaction.emoji) in all_emojis:
+            async for user in reaction.users():
+                if user.id == discord_client.user.id:
+                    try:
+                        await message.remove_reaction(reaction.emoji, discord_client.user)
+                    except Exception as e:
+                        log.warning(f"Konnte Reaktion {reaction.emoji} nicht entfernen: {e}")
 
 async def remove_number_reactions(message):
     fresh     = await message.channel.fetch_message(message.id)
@@ -1192,12 +1217,15 @@ async def remove_number_reactions(message):
             log.warning(f"Konnte Reaktion {emoji} nicht entfernen: {e}")
 
 # ── Screenshot verarbeiten und reposten ──────────────────────────────────────
-async def process_image(message, attachment):
+async def process_image(message, attachment, grid_override=None, page_override=None):
     """
     Verarbeitet ein Bild, postet es als Bot-Post und aktualisiert den Race-Kasten.
+    grid_override/page_override: manuelle Vorgabe via Reply-Befehl.
     Gibt (elapsed, success) zurueck.
     """
-    log.info(f"Verarbeite: {attachment.filename} von {message.author}")
+    log.info(f"Verarbeite: {attachment.filename} von {message.author}"
+             + (f" [Override: Grid {grid_override} Seite {page_override}]"
+                if grid_override else ""))
     channel = message.channel
     started = asyncio.get_event_loop().time()
     success = False
@@ -1249,9 +1277,21 @@ async def process_image(message, attachment):
             log.warning(f"Rennnummer aus Screenshot ({rennen_screenshot}) "
                         f"weicht von aktuellem Rennen ({aktuelles_rennen}) ab.")
 
+        # Manuelle Overrides anwenden
+        if grid_override is not None:
+            data["grid"] = grid_override
+        if page_override is not None:
+            # Seite wird ueber first_pos gesteuert: Seite 1 = P1, Seite 2 = anderer erster Platz
+            # Wir merken uns den Override fuer spaeter
+            pass
+
         warnings, rennen, grid_label, first_pos = write_results(
             sheet, data, rennen_override=aktuelles_rennen
         )
+
+        # Page-Override nach write_results anwenden
+        if page_override is not None:
+            page_override_val = page_override  # wird unten verwendet
 
         # Meldung ausgeben wenn Rennnummer nicht stimmt
         if rennen_screenshot != aktuelles_rennen and rennen_screenshot != 0:
@@ -1270,8 +1310,11 @@ async def process_image(message, attachment):
             except Exception:
                 pass
 
-        # Seite bestimmen: P1 = Seite 1, sonst Seite 2
-        page = 1 if (first_pos is None or first_pos == 1) else 2
+        # Seite bestimmen: P1 = Seite 1, sonst Seite 2 - oder manueller Override
+        if page_override is not None:
+            page = page_override
+        else:
+            page = 1 if (first_pos is None or first_pos == 1) else 2
 
         # Meldungen nach Prioritaet sortieren und posten
         warnings_sorted = sorted(
@@ -1438,6 +1481,100 @@ async def handle_command(message):
         except Exception:
             pass
 
+
+async def handle_reply(message):
+    """Verarbeitet Antworten auf Screenshots: 'Grid X [Seite Y]' oder 'Retry'."""
+    channel = message.channel
+    text    = message.content.strip()
+
+    # Referenzierten Post laden
+    try:
+        ref_msg = await channel.fetch_message(message.reference.message_id)
+    except Exception:
+        return
+
+    # Nur auf Posts mit Bildern reagieren
+    attachments = [a for a in ref_msg.attachments
+                   if a.content_type and a.content_type.startswith("image/")]
+    if not attachments:
+        return
+
+    # --- Retry ---
+    if text.lower() == "retry":
+        await remove_all_bot_reactions(ref_msg)
+        processing_ids.discard(ref_msg.id)
+        log.info(f"Retry: Alle Bot-Reaktionen von {ref_msg.id} entfernt.")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    # --- Grid X [Seite Y] ---
+    m = re.match(
+        r"grid\s+(\w+)(?:\s+seite\s+(\d+))?",
+        text, re.IGNORECASE
+    )
+    if not m:
+        return
+
+    grid_override = m.group(1).lower()  # z.B. "1", "2", "2a", "2b", "3"
+    page_override = int(m.group(2)) if m.group(2) else None
+
+    # Ohne Seite nur wenn Gemini verfuegbar
+    if page_override is None and gemini_is_blocked():
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await channel.send(
+            f"⏳ Gemini nicht verfuegbar. Bitte 'Grid {grid_override.upper()} Seite X' "
+            f"angeben damit der Screenshot manuell markiert werden kann."
+        )
+        return
+
+    # Alle alten Bot-Reaktionen entfernen (Neuverarbeitung)
+    await remove_all_bot_reactions(ref_msg)
+    processing_ids.discard(ref_msg.id)
+
+    if gemini_is_blocked():
+        # Manuell markieren
+        grid_emoji = GRID_EMOJI.get(grid_override, "❓")
+        page_emoji = PAGE_EMOJI.get(page_override, "❓")
+        try:
+            await ref_msg.add_reaction(grid_emoji)
+            await ref_msg.add_reaction(page_emoji)
+            await ref_msg.add_reaction(MANUAL_EMOJI)
+        except Exception as e:
+            log.warning(f"Konnte Reaktionen nicht setzen: {e}")
+        await channel.send(
+            f"⏳ Gemini nicht verfuegbar. "
+            f"Grid {grid_override.upper()} Seite {page_override} bitte manuell eintragen."
+        )
+        log.info(f"Manuell markiert: Grid {grid_override} Seite {page_override}")
+    else:
+        # Mit Override verarbeiten
+        attachment = attachments[0]
+        processing_ids.add(ref_msg.id)
+        log.info(f"Manueller Override: Grid {grid_override} Seite {page_override}")
+        _, success = await process_image(
+            ref_msg, attachment,
+            grid_override=grid_override,
+            page_override=page_override
+        )
+        if success is True:
+            try:
+                await ref_msg.delete()
+                log.info("Original-Post nach manuellem Override geloescht.")
+            except Exception:
+                pass
+            await cmd_sort(channel)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
 # ── Discord Bot ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1470,9 +1607,13 @@ async def scan_channel():
                 log.info(f"Gemini gesperrt, ueberspringe Bild-Scan. Noch ca. {mins} Minuten.")
                 # Befehle trotzdem verarbeiten (kein Gemini noetig)
                 async for message in channel.history(limit=20):
-                    if (message.content.startswith("!")
-                            and message.author.id != discord_client.user.id):
+                    if message.author.id == discord_client.user.id:
+                        continue
+                    if (message.content.startswith("!")):
                         await handle_command(message)
+                    elif (message.reference and
+                          re.match(r"(grid\s+\w+|retry)", message.content.strip(), re.IGNORECASE)):
+                        await handle_reply(message)
                 # Sperre aufgehoben?
                 if not gemini_is_blocked():
                     await clear_quota_msg(channel)
@@ -1481,15 +1622,22 @@ async def scan_channel():
 
             async for message in channel.history(limit=50):
 
-                # Befehle verarbeiten (nur von Nicht-Bot-Usern)
-                if (message.content.startswith("!")
-                        and message.author.id != discord_client.user.id):
+                # Nur Nicht-Bot-Nachrichten verarbeiten
+                if message.author.id == discord_client.user.id:
+                    continue
+
+                # Befehle verarbeiten
+                if message.content.startswith("!"):
                     await handle_command(message)
                     continue
 
-                # Nur fremde Posts mit Bildern auslesen
-                if message.author.id == discord_client.user.id:
+                # Reply-Befehle verarbeiten (Grid X [Seite Y] oder Retry)
+                if (message.reference and
+                        re.match(r"(grid\s+\w+|retry)", message.content.strip(), re.IGNORECASE)):
+                    await handle_reply(message)
                     continue
+
+                # Nur fremde Posts mit Bildern auslesen
                 if message.id in processing_ids:
                     continue
 
