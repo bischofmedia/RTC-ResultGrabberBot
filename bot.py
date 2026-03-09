@@ -439,11 +439,18 @@ def call_gemini(img, prompt):
         text = re.sub(r"\s*```$",     "", text)
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            # Gemini hat manchmal leicht fehlerhaftes JSON - Reparaturversuch
-            log.warning("JSON-Parsing fehlgeschlagen, versuche Reparatur...")
+        except json.JSONDecodeError as je:
+            log.warning(f"JSON-Parsing fehlgeschlagen ({je}), versuche Reparatur...")
+            log.warning(f"Rohe Gemini-Antwort: {text[:500]}")
+            # Trailing commas entfernen (,} und ,])
             text_fixed = re.sub(r",\s*([}\]])", r"\1", text)
-            return json.loads(text_fixed)
+            # Einfache Anfuehrungszeichen bei Property-Namen ersetzen
+            text_fixed = re.sub(r"'([^']+)'\s*:", r'"\1":', text_fixed)
+            try:
+                return json.loads(text_fixed)
+            except json.JSONDecodeError as je2:
+                log.error(f"JSON-Reparatur fehlgeschlagen ({je2}): {text_fixed[:500]}")
+                raise
     except ResourceExhausted as e:
         err_str = str(e).lower()
         if "per day" in err_str or "daily" in err_str or "quota_exceeded" in err_str:
