@@ -4,7 +4,6 @@ import time
 import json
 import asyncio
 import logging
-import requests
 import tempfile
 from datetime import datetime, timedelta
 
@@ -757,7 +756,6 @@ def build_race_embed(rennen):
 
             for i, row in enumerate(block_data):
                 rel_drv  = 0
-                rel_rt   = REL["racetime"]   - REL["driver"]
                 rel_laps = REL["laps"]       - REL["driver"]
                 rel_pen  = REL["penalty"]    - REL["driver"]
                 rel_tot  = REL["totaltime"]  - REL["driver"]
@@ -771,21 +769,28 @@ def build_race_embed(rennen):
                     continue  # ueberrundet - ignorieren
 
                 tot_raw = row[rel_tot].strip() if len(row) > rel_tot else ""
-                if not tot_raw or tot_raw == "8:00:00,000" or "DNF" in tot_raw.upper():
-                    continue  # DNF oder leer - ignorieren
+                # DNF: String "DNF" oder Sheets-Zeitwert >= 8 Stunden (= 8/24 Tag)
+                if not tot_raw:
+                    continue
+                if isinstance(tot_raw, (int, float)) and float(tot_raw) * 24 >= 8:
+                    continue  # DNF-Platzhalter
+                if isinstance(tot_raw, str) and ("DNF" in tot_raw.upper() or tot_raw == "8:00:00,000"):
+                    continue
 
-                # TotalTime als Sekunden parsen (Format HH:MM:SS,mmm oder MM:SS,mmm)
+                # TotalTime parsen: Google Sheets liefert float (Tagesbruchteil) oder String
                 try:
-                    tot_clean = tot_raw.replace(",", ".").replace(";", ".")
-                    parts = re.split(r"[:.]", tot_clean)
-                    if len(parts) == 4:
-                        # HH:MM:SS.mmm
-                        t_sek = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2]) + int(parts[3])/1000
-                    elif len(parts) == 3:
-                        # MM:SS.mmm
-                        t_sek = int(parts[0])*60 + int(parts[1]) + int(parts[2])/1000
+                    if isinstance(tot_raw, (int, float)):
+                        # Sheets-Zeitwert: Bruchteil eines Tages -> Sekunden
+                        t_sek = float(tot_raw) * 86400
                     else:
-                        continue
+                        tot_clean = str(tot_raw).replace(",", ".").replace(";", ".")
+                        parts = re.split(r"[:.]", tot_clean)
+                        if len(parts) == 4:
+                            t_sek = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2]) + int(parts[3])/1000
+                        elif len(parts) == 3:
+                            t_sek = int(parts[0])*60 + int(parts[1]) + int(parts[2])/1000
+                        else:
+                            continue
                 except Exception:
                     continue
 
@@ -1421,10 +1426,6 @@ async def process_image(message, attachment, grid_override=None, page_override=N
         warnings, rennen, grid_label, first_pos = write_results(
             sheet, data, rennen_override=aktuelles_rennen
         )
-
-        # Page-Override nach write_results anwenden
-        if page_override is not None:
-            page_override_val = page_override  # wird unten verwendet
 
         # Meldung ausgeben wenn Rennnummer nicht stimmt
         if rennen_screenshot != aktuelles_rennen and rennen_screenshot != 0:
