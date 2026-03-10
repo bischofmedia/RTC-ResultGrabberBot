@@ -136,6 +136,8 @@ REL = {
     "car":        4,
     "racetime":   5,
     "laps":       6,
+    "penalty":    7,   # Spalte I: Penalty in Sekunden z.B. "+10"
+    "totaltime":  9,   # Spalte K: TotalTime (Formelwert, Strafen einberechnet)
     "fl_driver":  4,
     "fl_time":    5,
 }
@@ -731,22 +733,94 @@ def build_race_embed(rennen):
         if drv_raw:
             lines.append(f"Drivers: {drv_raw}")
 
-        # Sieger je Grid-Block
-        winners = []
+        # Sieger je Grid-Block (anhand TotalTime, Strafen beruecksichtigt)
+        cs = col_start(rennen)
+        winners     = []
+        annotations = []  # Fussnoten fuer Abweichungen
         for block in range(4):
             gl_r, gl_c = get_grid_label_cell(rennen, block)
             gl_val     = (sheet.cell(gl_r, gl_c).value or "").strip()
             if not gl_val:
                 continue
-            win_r, win_c = get_cell(rennen, block, 1, "driver")
-            win_name     = (sheet.cell(win_r, win_c).value or "").strip()
-            if win_name:
-                winners.append(f"Grid {gl_val}: {win_name}")
+
+            # Alle Fahrer des Blocks lesen (max 20 Zeilen)
+            r_start = row_start(block)
+            block_data = sheet.get(
+                rowcol_to_a1(r_start, cs + REL["driver"]) + ":" +
+                rowcol_to_a1(r_start + 19, cs + REL["totaltime"])
+            )
+
+            best_time  = None
+            best_name  = None
+            p1_name    = None
+            p1_penalty = None
+
+            for i, row in enumerate(block_data):
+                rel_drv  = 0
+                rel_rt   = REL["racetime"]   - REL["driver"]
+                rel_laps = REL["laps"]       - REL["driver"]
+                rel_pen  = REL["penalty"]    - REL["driver"]
+                rel_tot  = REL["totaltime"]  - REL["driver"]
+
+                name = row[rel_drv].strip() if len(row) > rel_drv else ""
+                if not name:
+                    continue
+
+                laps_val = row[rel_laps].strip() if len(row) > rel_laps else ""
+                if laps_val:
+                    continue  # ueberrundet - ignorieren
+
+                tot_raw = row[rel_tot].strip() if len(row) > rel_tot else ""
+                if not tot_raw or tot_raw == "8:00:00,000" or "DNF" in tot_raw.upper():
+                    continue  # DNF oder leer - ignorieren
+
+                # TotalTime als Sekunden parsen (Format HH:MM:SS,mmm oder MM:SS,mmm)
+                try:
+                    tot_clean = tot_raw.replace(",", ".").replace(";", ".")
+                    parts = re.split(r"[:.]", tot_clean)
+                    if len(parts) == 4:
+                        # HH:MM:SS.mmm
+                        t_sek = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2]) + int(parts[3])/1000
+                    elif len(parts) == 3:
+                        # MM:SS.mmm
+                        t_sek = int(parts[0])*60 + int(parts[1]) + int(parts[2])/1000
+                    else:
+                        continue
+                except Exception:
+                    continue
+
+                if i == 0:
+                    p1_name = name
+                    pen_raw = row[rel_pen] if len(row) > rel_pen else ""
+                    if pen_raw not in ("", None):
+                        try:
+                            p1_penalty = int(float(str(pen_raw).strip()))
+                        except Exception:
+                            p1_penalty = None
+
+                if best_time is None or t_sek < best_time:
+                    best_time = t_sek
+                    best_name = name
+
+            if not best_name:
+                continue
+
+            # Pruefen ob P1-Fahrer != bester TotalTime-Fahrer
+            if p1_name and best_name != p1_name and p1_penalty:
+                winners.append(f"Grid {gl_val}: {best_name} ⚠️")
+                annotations.append(
+                    f"⚠️ Grid {gl_val}: {p1_name} (+{p1_penalty}s) → Sieg an {best_name}"
+                )
+            else:
+                winners.append(f"Grid {gl_val}: {best_name}")
 
         if winners:
             lines.append("")
             lines.append("**Sieger der Grids 🏆**")
             lines.extend(winners)
+            if annotations:
+                lines.append("")
+                lines.extend(annotations)
 
         # Schnellste Runde: erst Zeit, dann Name
         fl_drv = (sheet.cell(FASTEST_LAP_ROW, cs + REL["fl_driver"]).value or "").strip()
@@ -1180,6 +1254,47 @@ async def _repost_texts(channel, text_msgs):
         await channel.send(content_txt)
         await asyncio.sleep(0.3)
 
+async def cmd_textsort(channel):
+    """Sortiert nur Textnachrichten ans Ende (nach dem letzten Race-Kasten)."""
+    last_box_msg, _ = await find_last_race_box(channel)
+    text_msgs = []
+    async for msg in channel.history(limit=200, after=last_box_msg):
+        if msg.author.id != discord_client.user.id:
+            continue
+        has_image = any(a.content_type and a.content_type.startswith("image/")
+                        for a in msg.attachments)
+        if not has_image and not msg.embeds and msg.content:
+            text_msgs.append((msg, msg.content))
+    if text_msgs:
+        await _repost_texts(channel, text_msgs)
+        log.info(f"!textsort: {len(text_msgs)} Textnachrichten sortiert.")
+
+
+async def pipeline_empty(channel):
+    """Prueft ob keine unverarbeiteten User-Screenshots mehr im Channel sind."""
+    last_box_msg, _ = await find_last_race_box(channel)
+    async for msg in channel.history(limit=100, after=last_box_msg):
+        if msg.author.id == discord_client.user.id:
+            continue
+        attachments = [a for a in msg.attachments
+                       if a.content_type and a.content_type.startswith("image/")]
+        if not attachments:
+            continue
+        # Pruefen ob noch unverarbeitet (kein DONE/ERROR/MANUAL Emoji vom Bot)
+        has_final = False
+        for reaction in msg.reactions:
+            if str(reaction.emoji) in (DONE_EMOJI, ERROR_EMOJI, MANUAL_EMOJI):
+                async for user in reaction.users():
+                    if user.id == discord_client.user.id:
+                        has_final = True
+                        break
+            if has_final:
+                break
+        if not has_final:
+            return False  # Noch unverarbeitet
+    return True  # Alles erledigt
+
+
 # ── Reaktions-Hilfsfunktionen ─────────────────────────────────────────────────
 async def already_processed(message):
     try:
@@ -1411,6 +1526,34 @@ async def process_image(message, attachment, grid_override=None, page_override=N
     return elapsed, success
 
 # ── Befehls-Handler ───────────────────────────────────────────────────────────
+async def cmd_boxupgrade(channel, rennen, freitext=None):
+    """Editiert Race-Kasten fuer Rennen X mit aktuellen Tabellendaten."""
+    log.info(f"!boxupgrade fuer Rennen {rennen} gestartet.")
+    existing = await find_race_box(channel, rennen)
+    embed = build_race_embed_upgraded(rennen, freitext)
+    if existing:
+        try:
+            await existing.edit(embed=embed)
+            log.info(f"Race-Kasten Rennen {rennen} aktualisiert.")
+        except Exception as e:
+            log.error(f"Konnte Race-Kasten nicht editieren: {e}")
+            await channel.send(f"Fehler beim Aktualisieren von Race {rennen:02d}: {e}")
+    else:
+        await channel.send(embed=embed)
+        log.info(f"Race-Kasten Rennen {rennen} neu erstellt (war nicht vorhanden).")
+
+
+def build_race_embed_upgraded(rennen, freitext=None):
+    """Wie build_race_embed, aber mit echten Grid-Siegern und Freitext-Annotation."""
+    embed = build_race_embed(rennen)
+    if freitext:
+        # Freitext als zusaetzliche Zeile anhaengen
+        desc = embed.description or ""
+        desc += f"\n\n📋 {freitext}"
+        embed = discord.Embed(description=desc, color=0x1a1a2e)
+    return embed
+
+
 async def handle_command(message):
     """Verarbeitet Bot-Befehle. Loescht den User-Post danach."""
     channel = message.channel
@@ -1484,8 +1627,38 @@ async def handle_command(message):
             await cmd_sort(channel)
             await channel.send("Screenshots sortiert.", delete_after=5)
 
+        elif cmd == "!textsort":
+            await cmd_textsort(channel)
+
         elif cmd == "!clean":
             await cmd_clean(channel)
+
+        elif cmd == "!boxupgrade":
+            if len(parts) < 2:
+                await channel.send("Verwendung: !boxupgrade <Rennen> [Freitext]")
+                return
+            rn       = int(parts[1])
+            freitext = " ".join(parts[2:]) if len(parts) > 2 else None
+            await cmd_boxupgrade(channel, rn, freitext)
+
+        elif cmd == "!help":
+            lines = [
+                "**RaceResultBot – Befehle**",
+                "",
+                "**!next** – Nächstes Rennen starten (Race-Kasten ++, Clean, Sort falls nötig)",
+                "**!race X** – Rennen X starten (Race-Kasten auf X setzen, Clean, Sort falls nötig)",
+                "**!sort** – Screenshots nach Grid/Seite sortieren",
+                "**!textsort** – Nur Textnachrichten ans Ende sortieren",
+                "**!clean** – Bot-Nachrichten seit letztem Race-Kasten bereinigen, aktuelles Rennen grau färben",
+                "**!check** – Fahrer und Fahrzeuge validieren, Korrekturen vornehmen",
+                "**!update [X]** – Fahrzeugliste neu laden; optional Race-Kasten X aktualisieren",
+                "**!boxupgrade X [Freitext]** – Race-Kasten X aus Tabellendaten neu generieren (Strafen, Korrekturen)",
+                "",
+                "**Reply auf Screenshot mit 'Grid X Seite Y'** – Screenshot mit manuellen Werten verarbeiten",
+                "**Reply auf Screenshot mit 'Grid X'** – Screenshot verarbeiten (nur wenn Gemini verfügbar)",
+                "**Reply auf Screenshot mit 'Retry'** – Alle Bot-Reaktionen entfernen, Screenshot erneut auslesen",
+            ]
+            await channel.send("\n".join(lines))
 
         else:
             return
@@ -1698,13 +1871,18 @@ async def scan_channel():
                             log.info("Original-Post geloescht.")
                         except Exception as e:
                             log.warning(f"Konnte Original-Post nicht loeschen: {e}")
-                        # Kein Auto-Sort - wird manuell per !sort ausgeloest
+                        # textsort wenn keine weiteren Screenshots in der Pipeline
+                        if await pipeline_empty(channel):
+                            await cmd_textsort(channel)
                     else:
                         await message.add_reaction(NUMBER_EMOJIS[new_count - 1])
                         log.info(f"Bild {new_count}/{total} verarbeitet.")
                 elif success is False:
                     await remove_number_reactions(message)
                     await message.add_reaction(ERROR_EMOJI)
+                    # textsort auch bei Fehler wenn Pipeline leer
+                    if await pipeline_empty(channel):
+                        await cmd_textsort(channel)
                 # success is None -> Quota, kein Emoji
 
                 remaining = POLL_INTERVAL - elapsed
