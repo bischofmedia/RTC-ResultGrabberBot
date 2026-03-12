@@ -640,7 +640,9 @@ def write_results(sheet, data, rennen_override=None):
 
         racetime, laps = clean_time(zeit)
 
-        log.info(f"  P{pos} {name} | {auto} | racetime={racetime} "
+        name_log = f"{name_raw} -> {name}" if name != name_raw else name
+        auto_log = f"{auto_raw} -> {auto}" if auto != auto_raw else auto
+        log.info(f"  P{pos} {name_log} | {auto_log} | racetime={racetime} "
                  f"laps={laps} fl={beste_runde}")
 
         r_drv, c_drv = get_cell(rennen, block, pos, "driver")
