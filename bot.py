@@ -438,8 +438,10 @@ def repair_gemini_json(text):
     # 1. Typografische Anfuehrungszeichen in Werten -> gerade
     text = text.replace("“", '"').replace("”", '"')
     text = text.replace("‘", "'").replace("’", "'")
-    # 2. Trailing commas vor } und ]
-    text = re.sub(r",\s*([}\]])", r"", text)
+    # 2. Fehlendes } vor , { (Gemini vergisst manchmal schliessende Klammer)
+    text = re.sub(r'("|\ d)(\s*\n\s*),(\s*\{)', r'\1\2},\3', text)
+    # 3. Trailing commas vor } und ]
+    text = re.sub(r",\s*([}\\]])", r"\1", text)
     # 3. Einfache Anfuehrungszeichen bei Property-Namen -> doppelte
     text = re.sub(r"'([^'\n]+)'(\s*:)", r'"\1"\2', text)
     # 4. Unescapte Backslashes (ausser vor " n r t b f u)
