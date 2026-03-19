@@ -433,6 +433,43 @@ PROMPT_VERIFY_TEMPLATE = (
     "- Wenn alles korrekt, exakt dieselben Daten zurueckgeben\n"
 )
 
+def repair_gemini_json(text):
+    """Repariert haeufige JSON-Fehler in Gemini-Antworten."""
+    # 1. Typografische Anfuehrungszeichen in Werten -> gerade
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("‘", "'").replace("’", "'")
+    # 2. Trailing commas vor } und ]
+    text = re.sub(r",\s*([}\]])", r"", text)
+    # 3. Einfache Anfuehrungszeichen bei Property-Namen -> doppelte
+    text = re.sub(r"'([^'\n]+)'(\s*:)", r'"\1"\2', text)
+    # 4. Unescapte Backslashes (ausser vor " n r t b f u)
+    text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+    # 5. Steuerzeichen in Strings entfernen (Tabs, Newlines innerhalb von Strings)
+    # Ersetze echte Newlines innerhalb von JSON-String-Werten durch \n
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == '\\':
+            result.append(ch)
+            escape_next = True
+        elif ch == '"':
+            result.append(ch)
+            in_string = not in_string
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        elif in_string and ord(ch) < 32:
+            pass  # andere Steuerzeichen ignorieren
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
 def call_gemini(img, prompt):
     global gemini_blocked_until
     try:
@@ -446,16 +483,13 @@ def call_gemini(img, prompt):
         try:
             return json.loads(text)
         except json.JSONDecodeError as je:
-            log.warning(f"JSON-Parsing fehlgeschlagen ({je}), versuche Reparatur...")
-            log.warning(f"Rohe Gemini-Antwort: {text[:500]}")
-            # Trailing commas entfernen (,} und ,])
-            text_fixed = re.sub(r",\s*([}\]])", r"\1", text)
-            # Einfache Anfuehrungszeichen bei Property-Namen ersetzen
-            text_fixed = re.sub(r"'([^']+)'\s*:", r'"\1":', text_fixed)
+            log.warning(f"JSON-Parsing fehlgeschlagen ({je})")
+            log.warning(f"Rohe Gemini-Antwort: {text[:800]}")
+            fixed = repair_gemini_json(text)
             try:
-                return json.loads(text_fixed)
+                return json.loads(fixed)
             except json.JSONDecodeError as je2:
-                log.error(f"JSON-Reparatur fehlgeschlagen ({je2}): {text_fixed[:500]}")
+                log.error(f"JSON-Reparatur fehlgeschlagen ({je2}): {fixed[:500]}")
                 raise
     except ResourceExhausted as e:
         err_str = str(e).lower()
