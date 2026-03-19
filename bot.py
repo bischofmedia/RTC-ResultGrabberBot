@@ -30,6 +30,13 @@ GEMINI_BACKOFF_MINUTES = int(os.environ.get("GEMINI_BACKOFF_MINUTES", "60"))
 SPECIAL_EVENT_RAW  = os.environ.get("SPECIAL_EVENT", "")
 SPECIAL_EVENTS     = [s.strip().lower() for s in SPECIAL_EVENT_RAW.split(";") if s.strip()]
 
+async def run_sync(func, *args, **kwargs):
+    """Fuehrt synchrone Funktion in Thread-Pool aus um asyncio-Loop nicht zu blockieren."""
+    loop = asyncio.get_event_loop()
+    import functools
+    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+
+
 POLL_INTERVAL = 15
 DONE_EMOJI    = "\u2705"
 ERROR_EMOJI   = "\u274c"
@@ -940,7 +947,7 @@ async def find_race_box(channel, rennen):
 
 async def update_race_box(channel, rennen):
     """Aktualisiert Race-Kasten (oder erstellt neuen falls nicht vorhanden)."""
-    embed    = build_race_embed(rennen)
+    embed    = await run_sync(build_race_embed, rennen)
     existing = await find_race_box(channel, rennen)
     if existing:
         await existing.edit(embed=embed)
@@ -1082,7 +1089,7 @@ async def cmd_check(channel):
                 if cell not in all_grey:
                     all_grey.append(cell)
         if all_grey:
-            batch_format_cells(sheet, all_grey, [])
+            await run_sync(batch_format_cells, sheet, all_grey, [])
 
         # Alte Warnmeldungen im Channel loeschen wenn Eintrag jetzt korrekt ist
         corrected_names = {r[1].lower() for r in report if r[3] and r[0] == "Fahrer"}
@@ -1461,8 +1468,8 @@ async def process_image(message, attachment, grid_override=None, page_override=N
             # Wir merken uns den Override fuer spaeter
             pass
 
-        warnings, rennen, grid_label, first_pos = write_results(
-            sheet, data, rennen_override=aktuelles_rennen
+        warnings, rennen, grid_label, first_pos = await run_sync(
+            write_results, sheet, data, rennen_override=aktuelles_rennen
         )
 
         # Meldung ausgeben wenn Rennnummer nicht stimmt
@@ -1569,7 +1576,7 @@ async def cmd_boxupgrade(channel, rennen, freitext=None):
     """Editiert Race-Kasten fuer Rennen X mit aktuellen Tabellendaten."""
     log.info(f"!boxupgrade fuer Rennen {rennen} gestartet.")
     existing = await find_race_box(channel, rennen)
-    embed = build_race_embed_upgraded(rennen, freitext)
+    embed = await run_sync(build_race_embed_upgraded, rennen, freitext)
     if existing:
         try:
             await existing.edit(embed=embed)
