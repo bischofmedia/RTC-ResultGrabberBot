@@ -697,8 +697,10 @@ def write_results(sheet, data, rennen_override=None):
         batch[rowcol_to_a1(r_drv, c_drv)] = name
         batch[rowcol_to_a1(r_tm,  c_tm)]  = team
         batch[rowcol_to_a1(r_car, c_car)] = auto
-        batch[rowcol_to_a1(r_rt,  c_rt)]  = racetime if racetime is not None else ""
-        batch[rowcol_to_a1(r_lp,  c_lp)]  = laps     if laps     is not None else ""
+        if racetime is not None:
+            batch[rowcol_to_a1(r_rt, c_rt)] = racetime
+        if laps is not None:
+            batch[rowcol_to_a1(r_lp, c_lp)] = laps
 
         if auto_unbekannt:
             red_cells.append((r_car, c_car))
