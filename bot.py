@@ -27,7 +27,8 @@ GOOGLE_SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS     = os.environ["GOOGLE_CREDENTIALS"]
 GEMINI_2ND_RUN         = int(os.environ.get("GEMINI_2ND_RUN", "0"))
 GEMINI_BACKOFF_MINUTES = int(os.environ.get("GEMINI_BACKOFF_MINUTES", "60"))
-SPECIAL_EVENT_RAW  = os.environ.get("SPECIAL_EVENT", "")
+SPECIAL_EVENT_RAW       = os.environ.get("SPECIAL_EVENT", "")
+REGISTRATION_END_TIME   = os.environ.get("REGISTRATION_END_TIME", "20:45")  # Format HH:MM
 SPECIAL_EVENTS     = [s.strip().lower() for s in SPECIAL_EVENT_RAW.split(";") if s.strip()]
 
 async def run_sync(func, *args, **kwargs):
@@ -63,6 +64,11 @@ class GeminiQuotaError(Exception):
 
 # Nachrichten-IDs die gerade verarbeitet werden (verhindert Doppel-Scan)
 processing_ids: set = set()
+
+# Grid-Snapshot: {fahrername_lower: grid_label} - wird montags um REGISTRATION_END_TIME erstellt
+grid_snapshot: dict = {}
+grid_snapshot_rennen: int = 0  # fuer welches Rennen der Snapshot gilt
+grid_snapshot_done: bool = False  # ob Snapshot diese Woche bereits erstellt wurde
 
 # Aktuelle Quota-Warn-Nachricht (wird geupdated statt neu gepostet)
 quota_msg = None
@@ -1602,6 +1608,177 @@ def build_race_embed_upgraded(rennen, freitext=None):
     return embed
 
 
+# ── Grid-Snapshot und Anwesenheitspruefung ───────────────────────────────────
+
+GRID_SNAPSHOT_COLS = {
+    "1":  3,   # Spalte C
+    "2":  8,   # Spalte H
+    "2a": 8,   # Spalte H
+    "2b": 13,  # Spalte M
+    "3":  18,  # Spalte R
+}
+GRID_SNAPSHOT_ROWS = (6, 21)  # Zeile 6-21 (inkl.)
+
+
+def make_grid_snapshot():
+    """Liest Grids-Tabellenblatt aus und erstellt Snapshot {fahrername_lower: grid_label}."""
+    global grid_snapshot, grid_snapshot_done
+    try:
+        wb    = get_workbook()
+        sheet = wb.worksheet("Grids")
+        snapshot = {}
+        for grid_label, col in GRID_SNAPSHOT_COLS.items():
+            # Nur eindeutige Grids lesen (2a und 2b separat, nicht doppelt)
+            col_letter = rowcol_to_a1(1, col)[:-1]
+            vals = sheet.get(
+                f"{col_letter}{GRID_SNAPSHOT_ROWS[0]}:{col_letter}{GRID_SNAPSHOT_ROWS[1]}"
+            )
+            for row in vals:
+                name = row[0].strip() if row and row[0].strip() else ""
+                if name:
+                    snapshot[name.lower()] = grid_label
+        grid_snapshot      = snapshot
+        grid_snapshot_done = True
+        log.info(f"Grid-Snapshot erstellt: {len(snapshot)} Fahrer")
+        return True
+    except Exception as e:
+        log.error(f"Grid-Snapshot fehlgeschlagen: {e}")
+        return False
+
+
+def check_attendance(rennen):
+    """
+    Vergleicht Grid-Snapshot mit tatsaechlichen Ergebnissen in Blatt T.
+    Gibt (falsche_grids, abwesend) zurueck.
+    falsche_grids: [(name, soll_grid, ist_grid)]
+    abwesend:      [name]
+    """
+    if not grid_snapshot:
+        return [], []
+
+    try:
+        sheet = get_sheet()
+        cs    = col_start(rennen)
+
+        # Alle Fahrer aus Ergebnissen sammeln: {fahrername_lower: grid_label}
+        ergebnisse = {}
+        for block in range(4):
+            gl_r, gl_c = get_grid_label_cell(rennen, block)
+            gl_val     = (sheet.cell(gl_r, gl_c).value or "").strip().lower()
+            if not gl_val:
+                continue
+            r_start = row_start(block)
+            rows = sheet.get(
+                rowcol_to_a1(r_start, cs + REL["driver"]) + ":" +
+                rowcol_to_a1(r_start + 19, cs + REL["laps"])
+            )
+            for row in rows:
+                name = row[0].strip() if row and row[0].strip() else ""
+                if not name:
+                    continue
+                laps = row[REL["laps"] - REL["driver"]].strip() if len(row) > REL["laps"] - REL["driver"] else ""
+                rt   = row[REL["racetime"] - REL["driver"]].strip() if len(row) > REL["racetime"] - REL["driver"] else ""
+                # DNF/DSQ/ueberrundet zaehlen als anwesend
+                ergebnisse[name.lower()] = gl_val
+
+        falsche_grids = []
+        abwesend      = []
+
+        for name_lower, soll_grid in grid_snapshot.items():
+            # Originalname aus driver_map oder gt7_name_map
+            if name_lower in driver_map:
+                display_name = driver_map[name_lower][0]
+            elif name_lower in gt7_name_map:
+                display_name = gt7_name_map[name_lower][0]
+            else:
+                display_name = name_lower
+
+            if name_lower in ergebnisse:
+                ist_grid = ergebnisse[name_lower]
+                # Grid-Normalisierung: 2a/2b vs 2
+                soll_norm = soll_grid.lower().replace("a", "").replace("b", "")
+                ist_norm  = ist_grid.lower().replace("a", "").replace("b", "")
+                if ist_grid != soll_grid and not (soll_norm == ist_norm):
+                    falsche_grids.append((display_name, soll_grid.upper(), ist_grid.upper()))
+            else:
+                abwesend.append(display_name)
+
+        return falsche_grids, abwesend
+    except Exception as e:
+        log.error(f"Anwesenheitspruefung fehlgeschlagen: {e}")
+        return [], []
+
+
+async def post_attendance_check(channel, rennen):
+    """Fuehrt Anwesenheitspruefung durch und postet Ergebnis in Channel."""
+    if not grid_snapshot:
+        log.info("Kein Grid-Snapshot vorhanden, ueberspringe Anwesenheitspruefung.")
+        return
+
+    falsche_grids, abwesend = await run_sync(check_attendance, rennen)
+
+    lines = []
+    for name, soll, ist in falsche_grids:
+        lines.append(f"⚠️ {name}: Start in Grid {ist} statt Grid {soll}")
+
+    if abwesend:
+        if len(abwesend) == 1:
+            lines.append(f"❌ Abwesend: {abwesend[0]}")
+        else:
+            lines.append(f"❌ Abwesend: {', '.join(abwesend[:-1])} und {abwesend[-1]}")
+
+    if lines:
+        await channel.send("\n".join(lines))
+        log.info(f"Anwesenheit: {len(falsche_grids)} falsches Grid, {len(abwesend)} abwesend")
+    else:
+        log.info("Anwesenheitspruefung: alle Fahrer korrekt anwesend")
+
+
+async def snapshot_scheduler():
+    """Laeuft im Hintergrund und erstellt jeden Montag um REGISTRATION_END_TIME den Snapshot."""
+    global grid_snapshot_done
+    await discord_client.wait_until_ready()
+
+    try:
+        h, m = map(int, REGISTRATION_END_TIME.split(":"))
+    except Exception:
+        log.error(f"Ungueltige REGISTRATION_END_TIME: {REGISTRATION_END_TIME}")
+        return
+
+    log.info(f"Snapshot-Scheduler gestartet, Zielzeit: Montag {REGISTRATION_END_TIME} Uhr (Berlin)")
+    last_reset_week = None
+
+    while not discord_client.is_closed():
+        try:
+            try:
+                from zoneinfo import ZoneInfo
+                now = datetime.now(ZoneInfo("Europe/Berlin"))
+            except Exception:
+                now = datetime.utcnow() + timedelta(hours=2)
+
+            current_week = now.isocalendar()[1]
+
+            # Reset am Dienstag (weekday=1): snapshot_done zuruecksetzen fuer naechste Woche
+            if now.weekday() == 1 and last_reset_week != current_week:
+                grid_snapshot_done = False
+                last_reset_week    = current_week
+                log.info("Snapshot-Flag zurueckgesetzt (Dienstag).")
+
+            # Montag (weekday=0), Uhrzeit erreicht, noch kein Snapshot diese Woche
+            if (now.weekday() == 0
+                    and now.hour > h or (now.hour == h and now.minute >= m)
+                    and not grid_snapshot_done):
+                log.info("REGISTRATION_END_TIME erreicht, erstelle Grid-Snapshot...")
+                success = await run_sync(make_grid_snapshot)
+                if not success:
+                    log.error("Snapshot konnte nicht erstellt werden.")
+
+        except Exception as e:
+            log.error(f"Snapshot-Scheduler Fehler: {e}")
+
+        await asyncio.sleep(60)  # jede Minute pruefen
+
+
 async def handle_command(message):
     """Verarbeitet Bot-Befehle. Loescht den User-Post danach."""
     channel = message.channel
@@ -1624,6 +1801,7 @@ async def handle_command(message):
                     await cmd_sort(channel)
                 else:
                     log.info("!next: Channel bereits sortiert, kein !sort noetig")
+                await post_attendance_check(channel, next_rn - 1)
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
                 color=0x1a1a2e
@@ -1648,6 +1826,7 @@ async def handle_command(message):
                     await cmd_sort(channel)
                 else:
                     log.info("!race: Channel bereits sortiert, kein !sort noetig")
+                await post_attendance_check(channel, rn - 1)
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
                 color=0x1a1a2e
@@ -1972,6 +2151,7 @@ async def on_ready():
                 "Fahrzeugnamen werden nicht uebersetzt. Bitte !update ausfuehren nach Pruefung."
             )
     discord_client.loop.create_task(scan_channel())
+    discord_client.loop.create_task(snapshot_scheduler())
 
 async def main():
     await start_webserver()
