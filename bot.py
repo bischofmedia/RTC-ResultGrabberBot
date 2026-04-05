@@ -58,6 +58,7 @@ car_list = []
 car_translate_map: dict = {}
 driver_map:        dict = {}
 gt7_name_map:      dict = {}
+discord_id_map:    dict = {}  # {discord_id: (tabellenname, team)}
 
 class GeminiQuotaError(Exception):
     pass
@@ -237,10 +238,11 @@ def load_car_list():
 
 def load_driver_list():
     """Laedt Fahrerliste aus DB_drvr.
-    Spalte C = Tabellenname, Spalte K = Team, Spalte DB = GT7-Spielname.
-    Gibt zwei Dicts zurueck:
-      driver_map:    {lower_tabellenname: (tabellenname, team)}
-      gt7_name_map:  {lower_gt7name:      (tabellenname, team)}
+    Spalte C = Tabellenname, Spalte K = Team, Spalte DB = GT7-Spielname, Spalte DC = Discord-ID.
+    Gibt drei Dicts zurueck:
+      driver_map:     {lower_tabellenname: (tabellenname, team, discord_id_or_None)}
+      gt7_name_map:   {lower_gt7name:      (tabellenname, team, discord_id_or_None)}
+      discord_id_map: {discord_id:          (tabellenname, team)}
     """
     try:
         wb    = get_workbook()
@@ -248,32 +250,43 @@ def load_driver_list():
 
         # Spalte C+K: Tabellenname und Team
         rows_ck  = sheet.get("C5:K200")
-        # Spalte DB: GT7-Spielnamen (separate Abfrage)
+        # Spalte DB: GT7-Spielnamen
         rows_db  = sheet.get("DB5:DB200")
+        # Spalte DC (107): Discord-IDs
+        rows_dc  = sheet.get("DC5:DC200")
 
-        driver_map   = {}
-        gt7_name_map = {}
+        driver_map     = {}
+        gt7_name_map   = {}
+        discord_id_map = {}
 
         for i, row in enumerate(rows_ck):
             name = row[0].strip() if len(row) > 0 else ""
             team = row[8].strip() if len(row) > 8 else ""
+
+            dc_row     = rows_dc[i] if i < len(rows_dc) else []
+            discord_id = dc_row[0].strip() if dc_row and dc_row[0].strip() else None
+
             if name:
-                driver_map[name.lower()] = (name, team)
+                driver_map[name.lower()] = (name, team, discord_id)
+                if discord_id:
+                    discord_id_map[discord_id] = (name, team)
+
             # GT7-Name aus Spalte DB, gleiche Zeile
             gt7_row  = rows_db[i] if i < len(rows_db) else []
             gt7_name = gt7_row[0].strip() if gt7_row else ""
             if gt7_name and name:
-                gt7_name_map[gt7_name.lower()] = (name, team)
+                gt7_name_map[gt7_name.lower()] = (name, team, discord_id)
 
         if not driver_map:
             log.warning("Fahrerliste ist leer! Bitte DB_drvr pruefen (Spalte C ab Zeile 5).")
         else:
+            dc_count = sum(1 for v in driver_map.values() if v[2])
             log.info(f"Fahrerliste geladen: {len(driver_map)} Eintraege, "
-                     f"{len(gt7_name_map)} GT7-Namen")
-        return driver_map, gt7_name_map
+                     f"{len(gt7_name_map)} GT7-Namen, {dc_count} Discord-IDs")
+        return driver_map, gt7_name_map, discord_id_map
     except Exception as e:
         log.error(f"KRITISCH: Fahrerliste konnte nicht geladen werden: {e}")
-        return {}, {}
+        return {}, {}, {}
 
 # ── Grid-Block Aufloesung ─────────────────────────────────────────────────────
 def read_grid_label(sheet, rennen, block):
@@ -641,7 +654,7 @@ def write_results(sheet, data, rennen_override=None):
     fahrer_list = data["fahrer"]
     warnings    = []
 
-    driver_map, gt7_name_map = load_driver_list()
+    driver_map, gt7_name_map, discord_id_map = load_driver_list()
 
     block = resolve_block(sheet, rennen, grid_label)
     log.info(f"Rennen {rennen}, Grid '{grid_label}' -> Block {block}")
@@ -674,9 +687,9 @@ def write_results(sheet, data, rennen_override=None):
         # Erst Tabellenname (Spalte C), dann GT7-Name (Spalte DB)
         name_key = name_raw.lower()
         if name_key in driver_map:
-            name, team = driver_map[name_key]
+            name, team, _ = driver_map[name_key]
         elif name_key in gt7_name_map:
-            name, team = gt7_name_map[name_key]
+            name, team, _ = gt7_name_map[name_key]
         else:
             name = name_raw
             team = ""
@@ -1029,7 +1042,7 @@ async def cmd_check(channel):
 
         # Immer frisch laden damit neue Eintraege sofort wirken
         load_car_list()
-        driver_map, gt7_name_map = load_driver_list()
+        driver_map, gt7_name_map, discord_id_map = load_driver_list()
 
         batch_vals  = {}
         grey_cells  = []
@@ -1628,7 +1641,6 @@ def make_grid_snapshot():
         sheet = wb.worksheet("Grids")
         snapshot = {}
         for grid_label, col in GRID_SNAPSHOT_COLS.items():
-            # Nur eindeutige Grids lesen (2a und 2b separat, nicht doppelt)
             col_letter = rowcol_to_a1(1, col)[:-1]
             vals = sheet.get(
                 f"{col_letter}{GRID_SNAPSHOT_ROWS[0]}:{col_letter}{GRID_SNAPSHOT_ROWS[1]}"
@@ -1636,7 +1648,10 @@ def make_grid_snapshot():
             for row in vals:
                 name = row[0].strip() if row and row[0].strip() else ""
                 if name:
-                    snapshot[name.lower()] = grid_label
+                    # Discord-ID aus driver_map nachschlagen
+                    entry      = driver_map.get(name.lower())
+                    discord_id = entry[2] if entry else None
+                    snapshot[name.lower()] = (grid_label, discord_id)
         grid_snapshot      = snapshot
         grid_snapshot_done = True
         log.info(f"Grid-Snapshot erstellt: {len(snapshot)} Fahrer")
@@ -1649,9 +1664,10 @@ def make_grid_snapshot():
 def check_attendance(rennen):
     """
     Vergleicht Grid-Snapshot mit tatsaechlichen Ergebnissen in Blatt T.
+    Abgleich primaer per Discord-ID, Fallback per Name.
     Gibt (falsche_grids, abwesend) zurueck.
-    falsche_grids: [(name, soll_grid, ist_grid)]
-    abwesend:      [name]
+    falsche_grids: [(display_name, soll_grid, ist_grid)]
+    abwesend:      [display_name]
     """
     if not grid_snapshot:
         return [], []
@@ -1660,8 +1676,10 @@ def check_attendance(rennen):
         sheet = get_sheet()
         cs    = col_start(rennen)
 
-        # Alle Fahrer aus Ergebnissen sammeln: {fahrername_lower: grid_label}
-        ergebnisse = {}
+        # Alle Fahrer aus Ergebnissen sammeln
+        # Speichern: {name_lower: grid_label} UND {discord_id: grid_label}
+        ergebnisse_name = {}
+        ergebnisse_id   = {}
         for block in range(4):
             gl_r, gl_c = get_grid_label_cell(rennen, block)
             gl_val     = (sheet.cell(gl_r, gl_c).value or "").strip().lower()
@@ -1676,29 +1694,35 @@ def check_attendance(rennen):
                 name = row[0].strip() if row and row[0].strip() else ""
                 if not name:
                     continue
-                laps = row[REL["laps"] - REL["driver"]].strip() if len(row) > REL["laps"] - REL["driver"] else ""
-                rt   = row[REL["racetime"] - REL["driver"]].strip() if len(row) > REL["racetime"] - REL["driver"] else ""
-                # DNF/DSQ/ueberrundet zaehlen als anwesend
-                ergebnisse[name.lower()] = gl_val
+                ergebnisse_name[name.lower()] = gl_val
+                # Discord-ID nachschlagen
+                entry = driver_map.get(name.lower())
+                if entry and entry[2]:
+                    ergebnisse_id[entry[2]] = gl_val
 
         falsche_grids = []
         abwesend      = []
 
-        for name_lower, soll_grid in grid_snapshot.items():
-            # Originalname aus driver_map oder gt7_name_map
-            if name_lower in driver_map:
-                display_name = driver_map[name_lower][0]
-            elif name_lower in gt7_name_map:
-                display_name = gt7_name_map[name_lower][0]
+        for snapshot_key, (soll_grid, discord_id) in grid_snapshot.items():
+            # Originalname ermitteln
+            if snapshot_key in driver_map:
+                display_name = driver_map[snapshot_key][0]
+            elif snapshot_key in gt7_name_map:
+                display_name = gt7_name_map[snapshot_key][0]
             else:
-                display_name = name_lower
+                display_name = snapshot_key
 
-            if name_lower in ergebnisse:
-                ist_grid = ergebnisse[name_lower]
-                # Grid-Normalisierung: 2a/2b vs 2
+            # Abgleich: primaer per Discord-ID, Fallback per Name
+            ist_grid = None
+            if discord_id and discord_id in ergebnisse_id:
+                ist_grid = ergebnisse_id[discord_id]
+            elif snapshot_key in ergebnisse_name:
+                ist_grid = ergebnisse_name[snapshot_key]
+
+            if ist_grid is not None:
                 soll_norm = soll_grid.lower().replace("a", "").replace("b", "")
                 ist_norm  = ist_grid.lower().replace("a", "").replace("b", "")
-                if ist_grid != soll_grid and not (soll_norm == ist_norm):
+                if ist_grid != soll_grid and soll_norm != ist_norm:
                     falsche_grids.append((display_name, soll_grid.upper(), ist_grid.upper()))
             else:
                 abwesend.append(display_name)
@@ -1758,16 +1782,15 @@ async def snapshot_scheduler():
 
             current_week = now.isocalendar()[1]
 
-            # Reset am Dienstag (weekday=1): snapshot_done zuruecksetzen fuer naechste Woche
-            if now.weekday() == 1 and last_reset_week != current_week:
+            # Reset Montag um 0 Uhr: Snapshot loeschen (wird spaeter um 20:45 neu erstellt)
+            if now.weekday() == 0 and now.hour == 0 and last_reset_week != current_week:
                 grid_snapshot_done = False
                 last_reset_week    = current_week
-                log.info("Snapshot-Flag zurueckgesetzt (Dienstag).")
+                log.info("Snapshot-Flag zurueckgesetzt (Montag 0 Uhr).")
 
             # Montag (weekday=0), Uhrzeit erreicht, noch kein Snapshot diese Woche
-            if (now.weekday() == 0
-                    and now.hour > h or (now.hour == h and now.minute >= m)
-                    and not grid_snapshot_done):
+            time_reached = (now.hour > h) or (now.hour == h and now.minute >= m)
+            if now.weekday() == 0 and time_reached and not grid_snapshot_done:
                 log.info("REGISTRATION_END_TIME erreicht, erstelle Grid-Snapshot...")
                 success = await run_sync(make_grid_snapshot)
                 if not success:
@@ -2141,8 +2164,10 @@ async def start_webserver():
 
 @discord_client.event
 async def on_ready():
+    global driver_map, gt7_name_map, discord_id_map
     log.info(f"Eingeloggt als {discord_client.user}")
     load_car_list()  # laedt auch Car_Translate
+    driver_map, gt7_name_map, discord_id_map = load_driver_list()
     if not car_list:
         channel = discord_client.get_channel(DISCORD_CHANNEL_ID)
         if channel:
