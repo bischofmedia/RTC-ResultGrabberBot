@@ -312,18 +312,46 @@ def resolve_block(sheet, rennen, grid_label):
     return 2
 
 def shift_block(sheet, rennen, src_block, dst_block):
+    """Verschiebt einen Grid-Block per Batch-Read und Batch-Write (minimal API-Calls)."""
+    # Grid-Label verschieben
     sr, sc = get_grid_label_cell(rennen, src_block)
     dr, dc = get_grid_label_cell(rennen, dst_block)
-    sheet.update_cell(dr, dc, sheet.cell(sr, sc).value or "")
-    sheet.update_cell(sr, sc, "")
-    time.sleep(0.2)
-    for pos in range(1, 21):
-        for field in ("driver", "car", "racetime", "laps"):
-            sr2, sc2 = get_cell(rennen, src_block, pos, field)
-            dr2, dc2 = get_cell(rennen, dst_block, pos, field)
-            sheet.update_cell(dr2, dc2, sheet.cell(sr2, sc2).value or "")
-            sheet.update_cell(sr2, sc2, "")
-            time.sleep(0.1)
+    label_val = sheet.cell(sr, sc).value or ""
+
+    # Alle Daten des src_blocks in einem Aufruf lesen
+    cs = col_start(rennen)
+    r_start = row_start(src_block)
+    r_end   = r_start + 19
+    src_range = (rowcol_to_a1(r_start, cs + REL["driver"]) + ":" +
+                 rowcol_to_a1(r_end,   cs + REL["laps"]))
+    src_data = sheet.get(src_range)
+
+    # Batch-Update fuer Ziel-Block aufbauen
+    dst_r_start = row_start(dst_block)
+    updates = []
+    # Grid-Label
+    updates.append({"range": rowcol_to_a1(dr, dc), "values": [[label_val]]})
+    updates.append({"range": rowcol_to_a1(sr, sc), "values": [[""]]})
+    # Datenzeilen
+    for i, row in enumerate(src_data):
+        for j, field in enumerate(("driver", "team", "car", "racetime", "laps")):
+            val = row[j] if j < len(row) else ""
+            dr2, dc2 = get_cell(rennen, dst_block, i + 1, field if field != "team" else "driver")
+            # team hat keinen eigenen REL-Key in get_cell, manuell:
+        # Gesamte Zeile als Range
+        dst_r = dst_r_start + i
+        src_r = r_start + i
+        n_cols = REL["laps"] - REL["driver"] + 1
+        dst_range = (rowcol_to_a1(dst_r, cs + REL["driver"]) + ":" +
+                     rowcol_to_a1(dst_r, cs + REL["laps"]))
+        src_range_row = (rowcol_to_a1(src_r, cs + REL["driver"]) + ":" +
+                         rowcol_to_a1(src_r, cs + REL["laps"]))
+        row_vals = row + [""] * (n_cols - len(row)) if len(row) < n_cols else row[:n_cols]
+        updates.append({"range": dst_range, "values": [row_vals]})
+        updates.append({"range": src_range_row, "values": [[""]*n_cols]})
+
+    sheet.batch_update(updates)
+    log.info(f"shift_block: Block {src_block} -> {dst_block} in {len(updates)} Batch-Updates")
 
 # ── Zeit-Formatierung ─────────────────────────────────────────────────────────
 def clean_time(zeit):
@@ -400,7 +428,7 @@ def build_extract_prompt():
     if driver_map:
         names = sorted(driver_map.keys())
         # Originalnamen (nicht lowercase) aus den Werten holen
-        name_list = [driver_map[k][0] for k in names]
+        name_list = [driver_map[k][0] for k in names[:50]]  # max 50 Namen im Prompt
         names_str = ", ".join(f"'{n}'" for n in name_list)
         name_section = (
             "FAHRERNAMEN: Kopiere exakt so wie im Bild. Keine Korrekturen.\n"
@@ -498,13 +526,16 @@ def repair_gemini_json(text):
     return "".join(result)
 
 
+_gemini_rpm_strikes = 0  # Zaehlt aufeinanderfolgende RPM-Fehler fuer exponentiellen Backoff
+
 def call_gemini(img, prompt):
-    global gemini_blocked_until
+    global gemini_blocked_until, _gemini_rpm_strikes
     try:
         response = gemini_model.generate_content(
             [prompt, img],
             generation_config=GENERATION_CONFIG
         )
+        _gemini_rpm_strikes = 0  # Erfolg: Strikes zuruecksetzen
         text = response.text.strip()
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$",     "", text)
@@ -531,9 +562,12 @@ def call_gemini(img, prompt):
             log.error(f"Gemini Tageslimit erreicht. Sperre bis {reset.strftime('%H:%M')} Uhr.")
             raise GeminiQuotaError("daily") from e
         else:
-            # Minutenlimit: kurze Pause
-            gemini_blocked_until = datetime.now() + timedelta(minutes=5)
-            log.warning("Gemini Minutenlimit erreicht. Sperre fuer 5 Minuten.")
+            # Minutenlimit: Backoff exponentiell erhoehen (5 -> 10 -> 20 -> max 60 Min)
+            _gemini_rpm_strikes += 1
+            backoff = min(5 * (2 ** (_gemini_rpm_strikes - 1)), 60)
+            gemini_blocked_until = datetime.now() + timedelta(minutes=backoff)
+            log.warning(f"Gemini Minutenlimit erreicht (Strike {_gemini_rpm_strikes}). "
+                        f"Sperre fuer {backoff} Minuten.")
             raise GeminiQuotaError("rpm") from e
     except Exception as e:
         log.error(f"Gemini Fehler ({type(e).__name__}): {str(e)}")
