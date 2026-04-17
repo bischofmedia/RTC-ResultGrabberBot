@@ -619,7 +619,10 @@ async def check_gemini_version(channel):
         f"'Pruefe, ob ein Update auf Version [Versionsname] sinnvoll ist.'"
     )
     try:
-        response = gemini_model.generate_content(prompt, generation_config=GENERATION_CONFIG)
+        import asyncio as _asyncio
+        response = await _asyncio.to_thread(
+            gemini_model.generate_content, prompt, generation_config=GENERATION_CONFIG
+        )
         text = response.text.strip()
         log.info(f"Gemini-Versions-Check: {text}")
 
@@ -638,8 +641,18 @@ async def check_gemini_version(channel):
     except Exception as e:
         log.warning(f"Gemini-Versions-Check fehlgeschlagen: {e}")
 
-def analyse_image(image_path):
+def _analyse_image_sync(image_path):
+    """Synchroner Kern der Bildanalyse - wird in Thread ausgelagert."""
     img    = Image.open(image_path)
+
+    # Bild auf max 1600px Breite skalieren fuer kuerzere Verarbeitungszeit
+    max_width = 1600
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize((max_width, new_h), Image.LANCZOS)
+        log.info(f"Bild skaliert auf {max_width}x{new_h}")
+
     prompt = build_extract_prompt()
     data   = call_gemini(img, prompt)
     log.info(f"Durchlauf 1: Rennen {data.get('rennen')}, Grid {data.get('grid')}, "
@@ -1498,7 +1511,8 @@ async def process_image(message, attachment, grid_override=None, page_override=N
                 pass
 
         try:
-            data = analyse_image(tmp_path)
+            # Gemini-Aufruf in Thread auslagern - Event-Loop bleibt frei fuer Heartbeats
+            data = await asyncio.to_thread(_analyse_image_sync, tmp_path)
         except Exception:
             # status_msg wird im GeminiQuotaError-Block weiterverwendet,
             # bei anderen Fehlern loeschen
