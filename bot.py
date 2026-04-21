@@ -68,6 +68,7 @@ processing_ids: set = set()
 
 # Grid-Snapshot: {fahrername_lower: grid_label} - wird montags um REGISTRATION_END_TIME erstellt
 grid_snapshot: dict = {}
+grid_streamers: set  = set()
 grid_snapshot_rennen: int = 0  # fuer welches Rennen der Snapshot gilt
 grid_snapshot_done: bool = False  # ob Snapshot diese Woche bereits erstellt wurde
 
@@ -526,10 +527,38 @@ def repair_gemini_json(text):
     return "".join(result)
 
 
-_gemini_rpm_strikes = 0  # Zaehlt aufeinanderfolgende RPM-Fehler fuer exponentiellen Backoff
+_gemini_rpm_strikes   = 0    # Zaehlt aufeinanderfolgende RPM-Fehler
+_gemini_daily_count   = 0    # Zaehlt API-Calls heute
+_gemini_minute_count  = 0    # Zaehlt API-Calls in der aktuellen Minute
+_gemini_minute_start  = None # Startzeitpunkt des aktuellen Minuten-Fensters
+_gemini_last_call     = None # Zeitpunkt des letzten API-Calls (fuer 24h-Reset)
 
-def call_gemini(img, prompt):
+def call_gemini(img, prompt, reason="Screenshot"):
     global gemini_blocked_until, _gemini_rpm_strikes
+    global _gemini_daily_count, _gemini_minute_count, _gemini_minute_start, _gemini_last_call
+    from datetime import datetime as _dt
+    now = _dt.now()
+
+    # 24h-Reset: wenn letzter Call mehr als 24h her, Tageszaehler zuruecksetzen
+    if _gemini_last_call is not None and (now - _gemini_last_call).total_seconds() > 86400:
+        log.info(f"Gemini Tageszaehler zurueckgesetzt (letzter Call vor >24h).")
+        _gemini_daily_count  = 0
+        _gemini_minute_count = 0
+
+    # Tageszaehler erhoehen
+    _gemini_daily_count += 1
+    _gemini_last_call    = now
+
+    # Minutenzaehler: Fenster zuruecksetzen wenn > 60s vergangen
+    if _gemini_minute_start is None or (now - _gemini_minute_start).total_seconds() >= 60:
+        _gemini_minute_start = now
+        _gemini_minute_count = 1
+    else:
+        _gemini_minute_count += 1
+
+    log.info(f"Gemini API-Call: Grund={reason} | Heute={_gemini_daily_count} | "
+             f"Minute={_gemini_minute_count} (seit {_gemini_minute_start.strftime('%H:%M:%S')})")
+
     try:
         response = gemini_model.generate_content(
             [prompt, img],
@@ -552,7 +581,9 @@ def call_gemini(img, prompt):
                 raise
     except ResourceExhausted as e:
         err_str = str(e).lower()
-        if "per day" in err_str or "daily" in err_str or "quota_exceeded" in err_str:
+        if ("per day" in err_str or "daily" in err_str or "quota_exceeded" in err_str
+                or "requestsperday" in err_str or "perday" in err_str
+                or "free_tier_requests" in err_str):
             # Tageslimit: bis 09:00 Uhr lokaler Zeit (Google Reset = 0 Uhr Pacific = 9 Uhr DE)
             now  = datetime.now()
             reset = now.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -620,6 +651,22 @@ async def check_gemini_version(channel):
     )
     try:
         import asyncio as _asyncio
+        # Zaehler manuell erhoehen da wir nicht call_gemini nutzen
+        global _gemini_daily_count, _gemini_minute_count, _gemini_minute_start, _gemini_last_call
+        from datetime import datetime as _dt
+        now = _dt.now()
+        if _gemini_last_call is not None and (now - _gemini_last_call).total_seconds() > 86400:
+            _gemini_daily_count = 0
+            _gemini_minute_count = 0
+        _gemini_daily_count += 1
+        _gemini_last_call = now
+        if _gemini_minute_start is None or (now - _gemini_minute_start).total_seconds() >= 60:
+            _gemini_minute_start = now
+            _gemini_minute_count = 1
+        else:
+            _gemini_minute_count += 1
+        log.info(f"Gemini API-Call: Grund=Versionscheck | Heute={_gemini_daily_count} | "
+                 f"Minute={_gemini_minute_count}")
         response = await _asyncio.to_thread(
             gemini_model.generate_content, prompt, generation_config=GENERATION_CONFIG
         )
@@ -654,7 +701,7 @@ def _analyse_image_sync(image_path):
         log.info(f"Bild skaliert auf {max_width}x{new_h}")
 
     prompt = build_extract_prompt()
-    data   = call_gemini(img, prompt)
+    data   = call_gemini(img, prompt, reason="Screenshot Durchlauf 1")
     log.info(f"Durchlauf 1: Rennen {data.get('rennen')}, Grid {data.get('grid')}, "
              f"{len(data.get('fahrer', []))} Fahrer")
 
@@ -677,7 +724,7 @@ def _analyse_image_sync(image_path):
         log.info("Starte Durchlauf 2 (Verifikation)...")
         data2 = call_gemini(img, PROMPT_VERIFY_TEMPLATE.format(
             extracted=json.dumps(data, ensure_ascii=False, indent=2)
-        ))
+        ), reason="Screenshot Durchlauf 2")
         for f1, f2 in zip(data.get("fahrer", []), data2.get("fahrer", [])):
             for key in ("name", "auto", "zeit", "beste_runde"):
                 if f1.get(key) != f2.get(key):
@@ -1681,28 +1728,71 @@ GRID_SNAPSHOT_COLS = {
 GRID_SNAPSHOT_ROWS = (6, 21)  # Zeile 6-21 (inkl.)
 
 
+SNAPSHOT_FILE = "/home/ubuntu/RTC_RaceResultBot/grid_snapshot.txt"
+STREAMER_ROW  = 5  # Zeile 5 im Grids-Blatt enthaelt Streamer/Hosts
+
+# Streamer-Set: {name_lower} - werden im Snapshot gespeichert aber nicht als fehlend gewertet
+grid_streamers: set = set()
+
+
 def make_grid_snapshot():
-    """Liest Grids-Tabellenblatt aus und erstellt Snapshot {fahrername_lower: grid_label}."""
-    global grid_snapshot, grid_snapshot_done
+    """Liest Grids-Tabellenblatt aus und erstellt Snapshot."""
+    global grid_snapshot, grid_snapshot_done, grid_streamers
     try:
         wb    = get_workbook()
         sheet = wb.worksheet("Grids")
-        snapshot = {}
+        snapshot  = {}
+        streamers = set()
+
         for grid_label, col in GRID_SNAPSHOT_COLS.items():
             col_letter = rowcol_to_a1(1, col)[:-1]
+
+            # Zeile 5: Streamer/Host
+            streamer_val = sheet.cell(STREAMER_ROW, col).value
+            if streamer_val and streamer_val.strip():
+                streamers.add(streamer_val.strip().lower())
+
+            # Zeilen 6-21: Fahrer
             vals = sheet.get(
                 f"{col_letter}{GRID_SNAPSHOT_ROWS[0]}:{col_letter}{GRID_SNAPSHOT_ROWS[1]}"
             )
             for row in vals:
                 name = row[0].strip() if row and row[0].strip() else ""
                 if name:
-                    # Discord-ID aus driver_map nachschlagen
                     entry      = driver_map.get(name.lower())
                     discord_id = entry[2] if entry else None
                     snapshot[name.lower()] = (grid_label, discord_id)
+
         grid_snapshot      = snapshot
+        grid_streamers     = streamers
         grid_snapshot_done = True
-        log.info(f"Grid-Snapshot erstellt: {len(snapshot)} Fahrer")
+
+        # Log-Ausgabe
+        log.info(f"Grid-Snapshot erstellt: {len(snapshot)} Fahrer, {len(streamers)} Streamer")
+        for name_lower, (grid_label, _) in sorted(snapshot.items(), key=lambda x: x[1][0]):
+            log.info(f"  Snapshot: {name_lower} -> Grid {grid_label}")
+        for s in streamers:
+            log.info(f"  Streamer: {s}")
+
+        # TXT-Datei speichern
+        try:
+            lines = [f"Grid-Snapshot vom {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"]
+            for grid_label, col in GRID_SNAPSHOT_COLS.items():
+                fahrer = [n for n, (g, _) in snapshot.items() if g == grid_label]
+                if fahrer:
+                    lines.append(f"\nGrid {grid_label.upper()}:")
+                    for f in sorted(fahrer):
+                        lines.append(f"  {f}")
+            if streamers:
+                lines.append(f"\nStreamer/Hosts:")
+                for s in sorted(streamers):
+                    lines.append(f"  {s}")
+            with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            log.info(f"Snapshot gespeichert: {SNAPSHOT_FILE}")
+        except Exception as e:
+            log.warning(f"Snapshot-Datei konnte nicht gespeichert werden: {e}")
+
         return True
     except Exception as e:
         log.error(f"Grid-Snapshot fehlgeschlagen: {e}")
@@ -1712,13 +1802,10 @@ def make_grid_snapshot():
 def check_attendance(rennen):
     """
     Vergleicht Grid-Snapshot mit tatsaechlichen Ergebnissen in Blatt T.
-    Abgleich primaer per Discord-ID, Fallback per Name.
-    Gibt (falsche_grids, abwesend) zurueck.
-    falsche_grids: [(display_name, soll_grid, ist_grid)]
-    abwesend:      [display_name]
+    Gibt (falsche_grids, abwesend, unangemeldet) zurueck.
     """
     if not grid_snapshot:
-        return [], []
+        return [], [], []
 
     try:
         sheet = get_sheet()
@@ -1752,6 +1839,10 @@ def check_attendance(rennen):
         abwesend      = []
 
         for snapshot_key, (soll_grid, discord_id) in grid_snapshot.items():
+            # Streamer/Hosts werden nicht als fehlend gewertet
+            if snapshot_key in grid_streamers:
+                continue
+
             # Originalname ermitteln
             if snapshot_key in driver_map:
                 display_name = driver_map[snapshot_key][0]
@@ -1775,10 +1866,26 @@ def check_attendance(rennen):
             else:
                 abwesend.append(display_name)
 
-        return falsche_grids, abwesend
+        # Unangemeldete: in Ergebnissen aber nicht im Snapshot und kein Streamer
+        alle_snapshot_namen = set(grid_snapshot.keys())
+        alle_snapshot_ids   = {disc_id for _, (_, disc_id) in grid_snapshot.items() if disc_id}
+        unangemeldet = []
+        for name_lower, ist_grid in ergebnisse_name.items():
+            if name_lower in grid_streamers:
+                continue
+            if name_lower in alle_snapshot_namen:
+                continue
+            entry = driver_map.get(name_lower)
+            disc_id = entry[2] if entry else None
+            if disc_id and disc_id in alle_snapshot_ids:
+                continue
+            display_name = driver_map[name_lower][0] if name_lower in driver_map else name_lower
+            unangemeldet.append(display_name)
+
+        return falsche_grids, abwesend, unangemeldet
     except Exception as e:
         log.error(f"Anwesenheitspruefung fehlgeschlagen: {e}")
-        return [], []
+        return [], [], []
 
 
 async def post_attendance_check(channel, rennen):
@@ -1787,7 +1894,7 @@ async def post_attendance_check(channel, rennen):
         log.info("Kein Grid-Snapshot vorhanden, ueberspringe Anwesenheitspruefung.")
         return
 
-    falsche_grids, abwesend = await run_sync(check_attendance, rennen)
+    falsche_grids, abwesend, unangemeldet = await run_sync(check_attendance, rennen)
 
     lines = []
     for name, soll, ist in falsche_grids:
@@ -1799,9 +1906,16 @@ async def post_attendance_check(channel, rennen):
         else:
             lines.append(f"❌ Abwesend: {', '.join(abwesend[:-1])} und {abwesend[-1]}")
 
+    if unangemeldet:
+        if len(unangemeldet) == 1:
+            lines.append(f"ℹ️ Nicht angemeldet: {unangemeldet[0]}")
+        else:
+            lines.append(f"ℹ️ Nicht angemeldet: {', '.join(unangemeldet[:-1])} und {unangemeldet[-1]}")
+
     if lines:
         await channel.send("\n".join(lines))
-        log.info(f"Anwesenheit: {len(falsche_grids)} falsches Grid, {len(abwesend)} abwesend")
+        log.info(f"Anwesenheit: {len(falsche_grids)} falsches Grid, {len(abwesend)} abwesend, "
+                 f"{len(unangemeldet)} unangemeldet")
     else:
         log.info("Anwesenheitspruefung: alle Fahrer korrekt anwesend")
 
@@ -1939,6 +2053,19 @@ async def handle_command(message):
             freitext = " ".join(parts[2:]) if len(parts) > 2 else None
             await cmd_boxupgrade(channel, rn, freitext)
 
+        elif cmd == "!snapshot":
+            try:
+                with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                    txt = f.read()
+                # Discord-Nachrichtenlimit beachten
+                if len(txt) > 1900:
+                    txt = txt[:1900] + "\n..."
+                await channel.send(f"```\n{txt}\n```")
+            except FileNotFoundError:
+                await channel.send("Kein Snapshot vorhanden.")
+            except Exception as e:
+                await channel.send(f"Fehler beim Laden des Snapshots: {e}")
+
         elif cmd == "!help":
             lines = [
                 "**RaceResultBot – Befehle**",
@@ -1951,6 +2078,7 @@ async def handle_command(message):
                 "**!check** – Fahrer und Fahrzeuge validieren, Korrekturen vornehmen",
                 "**!update [X]** – Fahrzeugliste neu laden; optional Race-Kasten X aktualisieren",
                 "**!boxupgrade X [Freitext]** – Race-Kasten X aus Tabellendaten neu generieren (Strafen, Korrekturen)",
+                "**!snapshot** – Aktuellen Grid-Snapshot anzeigen (Anmeldungen zum Rennen)",
                 "",
                 "**Reply auf Screenshot mit 'Grid X Seite Y'** – Screenshot mit manuellen Werten verarbeiten",
                 "**Reply auf Screenshot mit 'Grid X'** – Screenshot verarbeiten (nur wenn Gemini verfügbar)",
