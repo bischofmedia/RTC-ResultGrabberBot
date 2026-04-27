@@ -490,6 +490,19 @@ PROMPT_VERIFY_TEMPLATE = (
 
 def repair_gemini_json(text):
     """Repariert haeufige JSON-Fehler in Gemini-Antworten."""
+    # 0. Halluzinierte Freitextzeilen entfernen (Gemini fuegt manchmal Kommentare ein)
+    clean_lines = text.split("\n")
+    cleaned = []
+    for _line in clean_lines:
+        _s = _line.strip()
+        if (not _s or _s.startswith('"') or _s.startswith("{") or
+                _s.startswith("}") or _s.startswith("[") or _s.startswith("]")
+                or _s == "," or _s.startswith("},")):
+            cleaned.append(_line)
+        else:
+            log.warning(f"Repair: Halluzinierte Zeile entfernt: {_s[:80]}")
+    text = "\n".join(cleaned)
+
     # 1. Typografische Anfuehrungszeichen in Werten -> gerade
     text = text.replace("“", '"').replace("”", '"')
     text = text.replace("‘", "'").replace("’", "'")
