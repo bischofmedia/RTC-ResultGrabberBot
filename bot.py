@@ -5,10 +5,12 @@ import json
 import asyncio
 import logging
 import tempfile
+import subprocess
 from datetime import datetime, timedelta
 
 import discord
 import gspread
+import pymysql
 from gspread.utils import rowcol_to_a1
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
@@ -23,8 +25,43 @@ log = logging.getLogger(__name__)
 DISCORD_TOKEN          = os.environ["DISCORD_TOKEN"]
 DISCORD_CHANNEL_ID     = int(os.environ["DISCORD_CHANNEL_ID"])
 GEMINI_API_KEY         = os.environ["GEMINI_API_KEY"]
-GOOGLE_SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS     = os.environ["GOOGLE_CREDENTIALS"]
+DB_HOST                = os.environ["DB_HOST"]
+DB_USER                = os.environ["DB_USER"]
+DB_PASSWORD            = os.environ["DB_PASSWORD"]
+DB_NAME                = os.environ["DB_NAME"]
+
+# GOOGLE_SHEET_ID wird aus der DB geladen (seasons.sheet_id WHERE is_active=1)
+# Fallback auf env-Variable falls DB nicht erreichbar
+def _load_sheet_id_from_db() -> str:
+    """Laedt sheet_id der aktiven Saison aus der Datenbank."""
+    try:
+        con = pymysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            database=DB_NAME, charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=5,
+        )
+        with con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT sheet_id FROM seasons WHERE is_active = 1 LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row and row["sheet_id"]:
+                    log.info(f"sheet_id aus DB geladen: {row['sheet_id']}")
+                    return row["sheet_id"]
+    except Exception as e:
+        log.warning(f"DB-Lookup fuer sheet_id fehlgeschlagen: {e}")
+    # Fallback: env-Variable
+    fallback = os.environ.get("GOOGLE_SHEET_ID", "")
+    if fallback:
+        log.warning(f"Verwende GOOGLE_SHEET_ID aus env als Fallback: {fallback}")
+    else:
+        log.error("Keine sheet_id gefunden – weder in DB noch in env!")
+    return fallback
+
+GOOGLE_SHEET_ID = _load_sheet_id_from_db()
 GEMINI_2ND_RUN         = int(os.environ.get("GEMINI_2ND_RUN", "0"))
 GEMINI_BACKOFF_MINUTES = int(os.environ.get("GEMINI_BACKOFF_MINUTES", "60"))
 SPECIAL_EVENT_RAW       = os.environ.get("SPECIAL_EVENT", "")
@@ -1977,6 +2014,57 @@ async def snapshot_scheduler():
         await asyncio.sleep(60)  # jede Minute pruefen
 
 
+# ── DB-Import-Trigger ─────────────────────────────────────────────────────────
+
+IMPORT_SCRIPT = "/home/ubuntu/RTC_RaceResultBot/rtc_import_results.py"
+
+async def trigger_db_import(channel, race_number: int | None = None):
+    """
+    Startet rtc_import_results.py als Hintergrundprozess.
+    race_number: wenn gesetzt, wird nur dieses Rennen importiert (--race X).
+    Postet kurze Status-Meldung in den Channel.
+    """
+    cmd = ["python3", IMPORT_SCRIPT]
+    if race_number is not None:
+        cmd += ["--race", str(race_number)]
+
+    race_str = f"Rennen {race_number}" if race_number else "alle Rennen"
+    log.info(f"DB-Import gestartet ({race_str}): {' '.join(cmd)}")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        # Nicht auf Abschluss warten – Bot bleibt reaktionsfaehig
+        asyncio.create_task(_watch_import(channel, proc, race_str))
+    except Exception as e:
+        log.error(f"DB-Import konnte nicht gestartet werden: {e}")
+        await channel.send(f"⚠️ DB-Import konnte nicht gestartet werden: {e}")
+
+
+async def _watch_import(channel, proc, race_str: str):
+    """Wartet auf Import-Prozess und postet Ergebnis."""
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        output    = stdout.decode("utf-8", errors="replace") if stdout else ""
+        if proc.returncode == 0:
+            log.info(f"DB-Import erfolgreich ({race_str}).")
+            await channel.send(f"✅ DB-Import abgeschlossen ({race_str}).")
+        else:
+            log.error(f"DB-Import fehlgeschlagen (exit {proc.returncode}):\n{output[-500:]}")
+            short = output[-300:] if len(output) > 300 else output
+            await channel.send(
+                f"❌ DB-Import fehlgeschlagen ({race_str}).\n```\n{short}\n```"
+            )
+    except asyncio.TimeoutError:
+        log.error("DB-Import Timeout (>120s).")
+        await channel.send(f"⚠️ DB-Import Timeout ({race_str}).")
+    except Exception as e:
+        log.error(f"DB-Import Ueberwachung fehlgeschlagen: {e}")
+
+
 async def handle_command(message):
     """Verarbeitet Bot-Befehle. Loescht den User-Post danach."""
     channel = message.channel
@@ -2000,6 +2088,8 @@ async def handle_command(message):
                 else:
                     log.info("!next: Channel bereits sortiert, kein !sort noetig")
                 await post_attendance_check(channel, next_rn - 1)
+                # DB-Import fuer abgeschlossenes Rennen triggern
+                await trigger_db_import(channel, race_number=next_rn - 1)
             embed = discord.Embed(
                 description=f"**Race {next_rn:02d}**",
                 color=0x1a1a2e
@@ -2025,6 +2115,8 @@ async def handle_command(message):
                 else:
                     log.info("!race: Channel bereits sortiert, kein !sort noetig")
                 await post_attendance_check(channel, rn - 1)
+                # DB-Import fuer abgeschlossenes Rennen triggern
+                await trigger_db_import(channel, race_number=rn - 1)
             embed = discord.Embed(
                 description=f"**Race {rn:02d}**",
                 color=0x1a1a2e
@@ -2079,6 +2171,42 @@ async def handle_command(message):
             except Exception as e:
                 await channel.send(f"Fehler beim Laden des Snapshots: {e}")
 
+        elif cmd == "!dbimport":
+            # !dbimport           → aktive Saison, alle Rennen
+            # !dbimport 3         → aktive Saison, nur Rennen 3
+            # !dbimport --season 12     → Saison 12, alle Rennen
+            # !dbimport --season 12 3  → Saison 12, Rennen 3
+            import_args = ["python3", IMPORT_SCRIPT]
+            race_num = None
+            season_id = None
+            rest = parts[1:]
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--season" and i + 1 < len(rest):
+                    season_id = rest[i + 1]
+                    i += 2
+                elif rest[i].isdigit():
+                    race_num = rest[i]
+                    i += 1
+                else:
+                    i += 1
+            if season_id:
+                import_args += ["--season", season_id]
+            if race_num:
+                import_args += ["--race", race_num]
+            race_str = (f"Saison {season_id or 'aktiv'}"
+                        + (f", Rennen {race_num}" if race_num else ", alle Rennen"))
+            await channel.send(f"⏳ DB-Import gestartet ({race_str})…")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *import_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                asyncio.create_task(_watch_import(channel, proc, race_str))
+            except Exception as e:
+                await channel.send(f"❌ Fehler beim Starten: {e}")
+
         elif cmd == "!help":
             lines = [
                 "**RaceResultBot – Befehle**",
@@ -2092,6 +2220,7 @@ async def handle_command(message):
                 "**!update [X]** – Fahrzeugliste neu laden; optional Race-Kasten X aktualisieren",
                 "**!boxupgrade X [Freitext]** – Race-Kasten X aus Tabellendaten neu generieren (Strafen, Korrekturen)",
                 "**!snapshot** – Aktuellen Grid-Snapshot anzeigen (Anmeldungen zum Rennen)",
+                "**!dbimport [--season X] [Rennen]** – DB-Import manuell starten (z.B. !dbimport 3 oder !dbimport --season 12)",
                 "",
                 "**Reply auf Screenshot mit 'Grid X Seite Y'** – Screenshot mit manuellen Werten verarbeiten",
                 "**Reply auf Screenshot mit 'Grid X'** – Screenshot verarbeiten (nur wenn Gemini verfügbar)",
