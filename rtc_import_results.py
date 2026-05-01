@@ -394,7 +394,7 @@ def parse_race_sheet(rows: list):
     Parst ein Rennen-Tabellenblatt.
 
     Layout (0-basierte Zeilen-/Spaltenindizes):
-      Zeile 1 (idx 1): Spalte 3 (D) = Streckenname (merged E2:K2, Index 3 in 0-Basis)
+      Zeile 1 (idx 1): Spalte 4 (E) = Streckenname (merged E2:K2, nach "Race:"-Label in D2)
       Zeile 2 (idx 2): Spalte 4 (E) = Datum, Spalte 6 (G) = Schnellste Runde,
                         Spalte 8 (I) = Fahrer Schnellste Runde
       Ab Zeile 6 (idx 6): Fahrerdaten
@@ -412,7 +412,7 @@ def parse_race_sheet(rows: list):
             return default
 
     # Metadaten
-    track_name    = r(1, 3)   # Spalte D in Zeile 2
+    track_name    = r(1, 4)   # Spalte E in Zeile 2 (nach "Race:"-Label in D2)
     race_date_str = r(2, 4)   # Spalte E in Zeile 3
     fastest_lap   = r(2, 6)   # Spalte G in Zeile 3
     fl_driver_psn = r(2, 8)   # Spalte I in Zeile 3
