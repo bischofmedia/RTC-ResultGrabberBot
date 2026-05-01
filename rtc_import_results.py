@@ -438,27 +438,42 @@ def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict,
                           cal: dict = None):
     """
     Gibt race_id zurueck. Legt races-Eintrag an wenn nicht vorhanden.
+    Bei bestehendem Eintrag: version_id wird neu berechnet und ggf. aktualisiert.
     cal: optionales Kalender-Dict aus parse_info_sheet {race_number: {...}}
     """
-    cur.execute(
-        "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
-        (season_id, race_number),
-    )
-    row = cur.fetchone()
-    if row:
-        return row["race_id"]
-
-    # Kalender-Daten bevorzugen, Sheet-Metadaten als Fallback
-    cal_entry  = (cal or {}).get(race_number, {})
-    track_name = cal_entry.get("track_name") or data.get("track_name", "")
-    race_date  = cal_entry.get("race_date")  or data.get("race_date")
-    laps       = cal_entry.get("laps")
+    cal_entry    = (cal or {}).get(race_number, {})
+    track_name   = cal_entry.get("track_name") or data.get("track_name", "")
+    race_date    = cal_entry.get("race_date")  or data.get("race_date")
+    laps         = cal_entry.get("laps")
     time_of_day  = cal_entry.get("time_of_day")
     weather_code = cal_entry.get("weather_code")
 
-    track_id   = lookup_track(cur, track_name)
-    version_id = lookup_version_id(cur, race_date)
+    cur.execute(
+        "SELECT race_id, version_id FROM races WHERE season_id = %s AND race_number = %s",
+        (season_id, race_number),
+    )
+    row = cur.fetchone()
 
+    # Korrekte version_id zum Renndatum berechnen
+    correct_version_id = lookup_version_id(cur, race_date)
+
+    if row:
+        race_id            = row["race_id"]
+        current_version_id = row["version_id"]
+        # version_id aktualisieren wenn ein neuerer passender Patch existiert
+        if correct_version_id != current_version_id:
+            cur.execute(
+                "UPDATE races SET version_id = %s WHERE race_id = %s",
+                (correct_version_id, race_id),
+            )
+            log.info(
+                f"  Rennen {race_number}: version_id aktualisiert "
+                f"{current_version_id} → {correct_version_id}"
+            )
+        return race_id
+
+    # Neu anlegen
+    track_id = lookup_track(cur, track_name)
     if not track_id:
         log.error(
             f"  Rennen {race_number}: Strecke '{track_name}' nicht in DB "
@@ -471,13 +486,13 @@ def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict,
            (season_id, track_id, version_id, race_number, race_date,
             laps, time_of_day, weather_code)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (season_id, track_id, version_id, race_number, race_date,
+        (season_id, track_id, correct_version_id, race_number, race_date,
          laps, time_of_day, weather_code),
     )
     race_id = cur.lastrowid
     log.info(
         f"  Rennen {race_number} neu angelegt: race_id={race_id}, "
-        f"track_id={track_id}, version_id={version_id}, date={race_date}, "
+        f"track_id={track_id}, version_id={correct_version_id}, date={race_date}, "
         f"laps={laps}, time_of_day={time_of_day}, weather={weather_code}"
     )
     return race_id
@@ -666,19 +681,27 @@ def parse_race_sheet(rows: list):
 def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = None):
     """
     Importiert ein Rennen. Gibt dict zurueck:
-      {"new": bool, "drivers": int, "penalties": int, "track": str}
+      {"new": bool, "version_updated": bool, "drivers": int, "penalties": int,
+       "track": str, "date": date}
     oder False bei Fehler.
     """
-    # Pruefen ob Rennen neu ist (vor lookup_or_create)
+    # Vor lookup_or_create: Existenz und aktuelle version_id merken
     cur.execute(
-        "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
+        "SELECT race_id, version_id FROM races WHERE season_id = %s AND race_number = %s",
         (season_id, race_number),
     )
-    is_new_race = cur.fetchone() is None
+    existing = cur.fetchone()
+    is_new_race      = existing is None
+    old_version_id   = existing["version_id"] if existing else None
 
     race_id = lookup_or_create_race(cur, season_id, race_number, data, cal)
     if not race_id:
         return False
+
+    # War version_id-Aenderung? Aktuelle version_id nochmal lesen
+    cur.execute("SELECT version_id FROM races WHERE race_id = %s", (race_id,))
+    new_version_id   = cur.fetchone()["version_id"]
+    version_updated  = (not is_new_race) and (new_version_id != old_version_id)
 
     cal_entry    = (cal or {}).get(race_number, {})
     laps         = cal_entry.get("laps")
@@ -826,11 +849,12 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
 
     log.info(f"  ✓ {inserted} Fahrer eingetragen.")
     return {
-        "new":       is_new_race,
-        "drivers":   inserted,
-        "penalties": new_penalties,
-        "track":     data["track_name"],
-        "date":      data["race_date"],
+        "new":             is_new_race,
+        "version_updated": version_updated,
+        "drivers":         inserted,
+        "penalties":       new_penalties,
+        "track":           data["track_name"],
+        "date":            data["race_date"],
     }
 
 
@@ -842,8 +866,8 @@ def _post_discord_summary(season_name: str, changes: list, errors: int):
     lines = [f"🗄️ **DB-Update {season_name}**"]
 
     for rn, r in changes:
-        track = r.get("track", "?")
-        date  = r.get("date")
+        track    = r.get("track", "?")
+        date     = r.get("date")
         date_str = date.strftime("%d.%m.%Y") if date else ""
 
         if r.get("new"):
@@ -857,6 +881,25 @@ def _post_discord_summary(season_name: str, changes: list, errors: int):
             if r.get("penalties"):
                 n = r["penalties"]
                 parts.append(f"{n} Strafe{'n' if n != 1 else ''} aktualisiert")
+            if r.get("version_updated"):
+                parts.append("Spielversion aktualisiert")
+            if not parts:
+                parts.append("Ergebnisse aktualisiert")
+            lines.append(f"  🔄 Rennen {rn} – {', '.join(parts)}")
+
+        if r.get("new"):
+            lines.append(
+                f"  ✅ Rennen {rn} erfasst – {track}"
+                + (f" ({date_str})" if date_str else "")
+                + f", {r['drivers']} Fahrer"
+            )
+        else:
+            parts = []
+            if r.get("penalties"):
+                n = r["penalties"]
+                parts.append(f"{n} Strafe{'n' if n != 1 else ''} aktualisiert")
+            if r.get("version_updated"):
+                parts.append("Spielversion aktualisiert")
             if not parts:
                 parts.append("Ergebnisse aktualisiert")
             lines.append(f"  🔄 Rennen {rn} – {', '.join(parts)}")
