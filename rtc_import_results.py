@@ -20,6 +20,9 @@ import re
 import sys
 import logging
 import argparse
+import urllib.request
+import urllib.error
+import json
 from datetime import datetime
 
 import pymysql
@@ -32,11 +35,13 @@ from googleapiclient.discovery import build
 ENV_PATH = "/etc/RTC_RaceResultBot-env"
 load_dotenv(ENV_PATH)
 
-DB_HOST     = os.getenv("DB_HOST")
-DB_USER     = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME     = os.getenv("DB_NAME")
-CREDS_PATH  = os.getenv("GOOGLE_CREDENTIALS")
+DB_HOST         = os.getenv("DB_HOST")
+DB_USER         = os.getenv("DB_USER")
+DB_PASSWORD     = os.getenv("DB_PASSWORD")
+DB_NAME         = os.getenv("DB_NAME")
+CREDS_PATH      = os.getenv("GOOGLE_CREDENTIALS")
+DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN_DATABASEBOT")
+DISCORD_LOG_CH  = os.getenv("DISCORD_CHANNEL_DATABASELOG")
 
 # Bonus-Typen (entsprechen bonus_type in bonus_points-Tabelle)
 BONUS_FL      = "FL"   # Schnellste Runde
@@ -60,6 +65,44 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("rtc_import")
+
+
+# ── Discord-Benachrichtigung ──────────────────────────────────────────────────
+
+def discord_notify(lines: list[str]):
+    """
+    Postet eine Nachricht in den Datenbank-Log-Channel via Discord REST API.
+    Kein discord.py benoetigt – nur stdlib urllib.
+    lines: Liste von Zeilen die zusammengefuegt werden.
+    """
+    if not DISCORD_TOKEN or not DISCORD_LOG_CH:
+        log.warning("DISCORD_TOKEN_DATABASEBOT oder DISCORD_CHANNEL_DATABASELOG nicht gesetzt – kein Discord-Log.")
+        return
+    content = "\n".join(lines)
+    if len(content) > 1900:
+        content = content[:1900] + "\n…"
+    url     = f"https://discord.com/api/v10/channels/{DISCORD_LOG_CH}/messages"
+    payload = json.dumps({"content": content}).encode("utf-8")
+    req     = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bot {DISCORD_TOKEN}",
+            "Content-Type":  "application/json",
+            "User-Agent":    "RTC-ImportBot/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 201):
+                log.info("Discord-Log gepostet.")
+            else:
+                log.warning(f"Discord-Log: unerwarteter Status {resp.status}")
+    except urllib.error.HTTPError as e:
+        log.warning(f"Discord-Log fehlgeschlagen: HTTP {e.code} – {e.read().decode()[:200]}")
+    except Exception as e:
+        log.warning(f"Discord-Log fehlgeschlagen: {e}")
 
 
 # ── Datenbank ─────────────────────────────────────────────────────────────────
@@ -621,6 +664,18 @@ def parse_race_sheet(rows: list):
 # ── DB-Import ─────────────────────────────────────────────────────────────────
 
 def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = None):
+    """
+    Importiert ein Rennen. Gibt dict zurueck:
+      {"new": bool, "drivers": int, "penalties": int, "track": str}
+    oder False bei Fehler.
+    """
+    # Pruefen ob Rennen neu ist (vor lookup_or_create)
+    cur.execute(
+        "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
+        (season_id, race_number),
+    )
+    is_new_race = cur.fetchone() is None
+
     race_id = lookup_or_create_race(cur, season_id, race_number, data, cal)
     if not race_id:
         return False
@@ -655,6 +710,14 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
          race_id),
     )
 
+    # Alten Stand fuer Change-Detection lesen (vor dem Loeschen)
+    cur.execute(
+        "SELECT driver_id, penalty_seconds FROM race_results WHERE race_id = %s",
+        (race_id,)
+    )
+    old_rows        = {r["driver_id"]: r["penalty_seconds"] for r in cur.fetchall()}
+    old_driver_ids  = set(old_rows.keys())
+
     # Bestehende Ergebnisse loeschen (bonus_points zuerst wegen FK)
     cur.execute(
         "DELETE FROM bonus_points WHERE result_id IN "
@@ -667,7 +730,9 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
     grid_numbers_needed = {e["grid_number"] for e in data["entries"] if e["grid_number"]}
     ensure_grids(cur, race_id, grid_numbers_needed)
 
-    inserted = 0
+    inserted        = 0
+    new_penalties   = 0  # Fahrer mit Strafe die vorher keine hatten (oder mehr Strafe)
+
     for entry in data["entries"]:
         psn  = entry["psn_name"]
         d_id = lookup_or_create_driver(cur, psn)
@@ -749,10 +814,57 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 "INSERT INTO bonus_points (result_id, bonus_type, points) VALUES (%s,%s,%s)",
                 (result_id, BONUS_FT, entry["loyalty_bonus"]),
             )
+
+        # Change-Detection: Strafe neu oder geaendert?
+        pen = entry["penalty_sec"] or 0
+        if pen > 0:
+            old_pen = old_rows.get(d_id, 0) or 0
+            if old_pen != pen:
+                new_penalties += 1
+
         inserted += 1
 
     log.info(f"  ✓ {inserted} Fahrer eingetragen.")
-    return True
+    return {
+        "new":       is_new_race,
+        "drivers":   inserted,
+        "penalties": new_penalties,
+        "track":     data["track_name"],
+        "date":      data["race_date"],
+    }
+
+
+def _post_discord_summary(season_name: str, changes: list, errors: int):
+    """
+    Baut die Discord-Nachricht aus den Import-Ergebnissen und postet sie.
+    changes: Liste von (race_number, result_dict)
+    """
+    lines = [f"🗄️ **DB-Update {season_name}**"]
+
+    for rn, r in changes:
+        track = r.get("track", "?")
+        date  = r.get("date")
+        date_str = date.strftime("%d.%m.%Y") if date else ""
+
+        if r.get("new"):
+            lines.append(
+                f"  ✅ Rennen {rn} erfasst – {track}"
+                + (f" ({date_str})" if date_str else "")
+                + f", {r['drivers']} Fahrer"
+            )
+        else:
+            parts = []
+            if r.get("penalties"):
+                n = r["penalties"]
+                parts.append(f"{n} Strafe{'n' if n != 1 else ''} aktualisiert")
+            if not parts:
+                parts.append("Ergebnisse aktualisiert")
+            lines.append(f"  🔄 Rennen {rn} – {', '.join(parts)}")
+
+    if errors:
+        lines.append(f"  ⚠️ {errors} Fehler – Details im Log prüfen.")
+
+    discord_notify(lines)
 
 
 # ── Hauptprogramm ─────────────────────────────────────────────────────────────
@@ -816,9 +928,10 @@ def main():
 
         log.info(f"Zu importierende Tabs: {race_tabs}")
 
-        imported = 0
-        skipped  = 0
-        errors   = 0
+        imported  = 0
+        skipped   = 0
+        errors    = 0
+        changes   = []   # Sammlung fuer Discord-Log
 
         for tab in race_tabs:
             race_number = int(tab)
@@ -832,17 +945,25 @@ def main():
                 skipped += 1
                 continue
 
-            ok = import_race(cur, season_id, race_number, data, cal)
-            if ok:
-                imported += 1
-            else:
+            result = import_race(cur, season_id, race_number, data, cal)
+            if result is False:
                 errors += 1
+            else:
+                imported += 1
+                changes.append((race_number, result))
 
         db.commit()
         log.info(
             f"✓ Import abgeschlossen: {imported} importiert, "
             f"{skipped} uebersprungen, {errors} Fehler."
         )
+
+        # Discord-Log nur wenn etwas passiert ist
+        if changes:
+            _post_discord_summary(season["name"], changes, errors)
+        elif errors:
+            discord_notify([f"⚠️ **DB-Import {season['name']}** – {errors} Fehler aufgetreten, nichts importiert."])
+
         if errors:
             sys.exit(1)
 
