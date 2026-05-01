@@ -98,7 +98,58 @@ def list_sheet_tabs(service, sheet_id: str) -> list:
     return [s["properties"]["title"] for s in meta["sheets"]]
 
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+def parse_info_sheet(rows: list) -> dict:
+    """
+    Liest den Rennkalender aus dem Info-Tabellenblatt.
+    Ab Zeile 24 (Index 23), Spalten (0-basiert):
+      B=1: Rennnummer, C=2: Datum, E=4: Track (sheet_name),
+      F=5: Laps, G=6: Time of Day, H=7: Weather Code
+
+    Gibt dict zurueck: {race_number: {race_date, track_name, laps, time_of_day, weather_code}}
+    Zeilen ohne Rennnummer (Pausen) werden uebersprungen.
+    """
+    calendar = {}
+    for row in rows[23:]:  # ab Zeile 24 (Index 23)
+        rn_raw = str(row[1]).strip() if len(row) > 1 else ""
+        if not rn_raw or not rn_raw.isdigit():
+            continue  # Pause oder Leerzeile
+
+        rn = int(rn_raw)
+
+        def c(idx, default=""):
+            try:
+                return str(row[idx]).strip()
+            except (IndexError, TypeError):
+                return default
+
+        date_raw  = c(2)
+        race_date = None
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                race_date = datetime.strptime(date_raw, fmt).date()
+                break
+            except ValueError:
+                pass
+
+        laps_raw = c(5)
+        try:
+            laps = int(laps_raw) if laps_raw else None
+        except ValueError:
+            laps = None
+
+        calendar[rn] = {
+            "race_date":    race_date,
+            "track_name":   c(4),
+            "laps":         laps,
+            "time_of_day":  c(6) or None,
+            "weather_code": c(7) or None,
+        }
+
+    log.info(f"Info-Sheet: {len(calendar)} Rennen im Kalender gefunden.")
+    return calendar
+
+
+
 
 def cell(row: list, idx: int, default="") -> str:
     try:
@@ -340,10 +391,11 @@ def lookup_version_id(cur, race_date) -> int:
     return row["version_id"] if row else 62  # 62 = GT7 1.05 Release
 
 
-def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict):
+def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict,
+                          cal: dict = None):
     """
     Gibt race_id zurueck. Legt races-Eintrag an wenn nicht vorhanden.
-    Benoetigt track_name und race_date aus data.
+    cal: optionales Kalender-Dict aus parse_info_sheet {race_number: {...}}
     """
     cur.execute(
         "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
@@ -353,27 +405,37 @@ def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict):
     if row:
         return row["race_id"]
 
-    # Neu anlegen
-    track_id   = lookup_track(cur, data["track_name"])
-    version_id = lookup_version_id(cur, data["race_date"])
+    # Kalender-Daten bevorzugen, Sheet-Metadaten als Fallback
+    cal_entry  = (cal or {}).get(race_number, {})
+    track_name = cal_entry.get("track_name") or data.get("track_name", "")
+    race_date  = cal_entry.get("race_date")  or data.get("race_date")
+    laps       = cal_entry.get("laps")
+    time_of_day  = cal_entry.get("time_of_day")
+    weather_code = cal_entry.get("weather_code")
+
+    track_id   = lookup_track(cur, track_name)
+    version_id = lookup_version_id(cur, race_date)
 
     if not track_id:
         log.error(
-            f"  Rennen {race_number}: Strecke '{data['track_name']}' nicht in DB "
+            f"  Rennen {race_number}: Strecke '{track_name}' nicht in DB "
             f"(sheet_name-Spalte pruefen). Rennen kann nicht angelegt werden."
         )
         return None
 
     cur.execute(
         """INSERT INTO races
-           (season_id, track_id, version_id, race_number, race_date)
-           VALUES (%s, %s, %s, %s, %s)""",
-        (season_id, track_id, version_id, race_number, data["race_date"]),
+           (season_id, track_id, version_id, race_number, race_date,
+            laps, time_of_day, weather_code)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (season_id, track_id, version_id, race_number, race_date,
+         laps, time_of_day, weather_code),
     )
     race_id = cur.lastrowid
     log.info(
         f"  Rennen {race_number} neu angelegt: race_id={race_id}, "
-        f"track_id={track_id}, version_id={version_id}, date={data['race_date']}"
+        f"track_id={track_id}, version_id={version_id}, date={race_date}, "
+        f"laps={laps}, time_of_day={time_of_day}, weather={weather_code}"
     )
     return race_id
 
@@ -558,10 +620,15 @@ def parse_race_sheet(rows: list):
 
 # ── DB-Import ─────────────────────────────────────────────────────────────────
 
-def import_race(cur, season_id: int, race_number: int, data: dict):
-    race_id = lookup_or_create_race(cur, season_id, race_number, data)
+def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = None):
+    race_id = lookup_or_create_race(cur, season_id, race_number, data, cal)
     if not race_id:
         return False
+
+    cal_entry    = (cal or {}).get(race_number, {})
+    laps         = cal_entry.get("laps")
+    time_of_day  = cal_entry.get("time_of_day")
+    weather_code = cal_entry.get("weather_code")
 
     log.info(f"  race_id={race_id} | {len(data['entries'])} Fahrer | "
              f"Datum={data['race_date']} | Strecke={data['track_name']}")
@@ -573,14 +640,19 @@ def import_race(cur, season_id: int, race_number: int, data: dict):
         if not fl_driver_id:
             log.warning(f"  FL-Fahrer '{data['fl_driver_psn']}' nicht in DB.")
 
-    # races-Tabelle: Datum und Schnellste-Runde aktualisieren
+    # races-Tabelle: alle bekannten Felder aktualisieren
     cur.execute(
         """UPDATE races SET
              race_date              = COALESCE(%s, race_date),
              fastest_lap_time       = %s,
-             fastest_lap_driver_id  = %s
+             fastest_lap_driver_id  = %s,
+             laps                   = COALESCE(%s, laps),
+             time_of_day            = COALESCE(%s, time_of_day),
+             weather_code           = COALESCE(%s, weather_code)
            WHERE race_id = %s""",
-        (data["race_date"], data["fastest_lap_time"], fl_driver_id, race_id),
+        (data["race_date"], data["fastest_lap_time"], fl_driver_id,
+         laps, time_of_day, weather_code,
+         race_id),
     )
 
     # Bestehende Ergebnisse loeschen (bonus_points zuerst wegen FK)
@@ -724,6 +796,14 @@ def main():
 
         svc = get_sheets_service()
 
+        # Info-Sheet laden (Rennkalender mit Laps, Time of Day, Weather)
+        cal = {}
+        try:
+            info_rows = fetch_sheet(svc, sheet_id, "Info")
+            cal = parse_info_sheet(info_rows)
+        except Exception as e:
+            log.warning(f"Info-Sheet konnte nicht geladen werden: {e} – fahre ohne Kalender fort.")
+
         # Verfuegbare numerische Tabs ermitteln
         tabs = list_sheet_tabs(svc, sheet_id)
         race_tabs = sorted([t for t in tabs if t.isdigit()], key=lambda x: int(x))
@@ -752,7 +832,7 @@ def main():
                 skipped += 1
                 continue
 
-            ok = import_race(cur, season_id, race_number, data)
+            ok = import_race(cur, season_id, race_number, data, cal)
             if ok:
                 imported += 1
             else:
