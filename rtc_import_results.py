@@ -775,11 +775,12 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
 
     # Alten Stand fuer Change-Detection lesen (vor dem Loeschen)
     cur.execute(
-        "SELECT driver_id, penalty_seconds, finish_pos_overall, points_total "
+        "SELECT driver_id, penalty_seconds, finish_pos_overall, points_total, "
+        "rating_at_race, finish_pos_grid "
         "FROM race_results WHERE race_id = %s",
         (race_id,)
     )
-    old_rows = {r["driver_id"]: r for r in cur.fetchall()}
+    old_rows  = {r["driver_id"]: r for r in cur.fetchall()}
     old_count = len(old_rows)
 
     # Bestehende Ergebnisse loeschen (bonus_points zuerst wegen FK)
@@ -794,8 +795,10 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
     grid_numbers_needed = {e["grid_number"] for e in data["entries"] if e["grid_number"]}
     ensure_grids(cur, race_id, grid_numbers_needed)
 
-    inserted      = 0
-    new_penalties = 0  # Strafen die neu sind oder sich geaendert haben
+    inserted          = 0
+    new_penalties     = 0  # Strafen die neu sind oder sich geaendert haben
+    ratings_updated   = 0  # Ratings die neu berechnet wurden oder sich geaendert haben
+    grid_pos_inserted = 0  # finish_pos_grid die neu eingetragen wurden
 
     for entry in data["entries"]:
         psn  = entry["psn_name"]
@@ -888,26 +891,44 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
             if old_pen != pen:
                 new_penalties += 1
 
+        # Change-Detection: Rating neu oder geaendert?
+        old = old_rows.get(d_id) or {}
+        new_rating = entry["rating"]
+        old_rating = old.get("rating_at_race")
+        if new_rating is not None and (old_rating is None or
+                abs(float(old_rating) - float(new_rating)) > 0.01):
+            ratings_updated += 1
+
+        # Change-Detection: finish_pos_grid neu eingetragen?
+        new_gpg = entry.get("finish_pos_grid")
+        old_gpg = old.get("finish_pos_grid")
+        if new_gpg is not None and old_gpg is None:
+            grid_pos_inserted += 1
+
         inserted += 1
 
-    # Echte Aenderung: neue Fahrer, Strafen geaendert, oder Spielversion geaendert
+    # Echte Aenderung: neue Fahrer, Strafen, Rating, GridPos, oder Spielversion
     something_changed = (
         is_new_race
         or version_updated
         or new_penalties > 0
+        or ratings_updated > 0
+        or grid_pos_inserted > 0
         or inserted != old_count
     )
 
     log.info(f"  ✓ {inserted} Fahrer eingetragen."
              + (" (keine Aenderung)" if not something_changed else ""))
     return {
-        "new":             is_new_race,
-        "version_updated": version_updated,
-        "changed":         something_changed,
-        "drivers":         inserted,
-        "penalties":       new_penalties,
-        "track":           data["track_name"],
-        "date":            data["race_date"],
+        "new":              is_new_race,
+        "version_updated":  version_updated,
+        "changed":          something_changed,
+        "drivers":          inserted,
+        "penalties":        new_penalties,
+        "ratings_updated":  ratings_updated,
+        "grid_pos_inserted": grid_pos_inserted,
+        "track":            data["track_name"],
+        "date":             data["race_date"],
     }
 
 
@@ -934,23 +955,12 @@ def _post_discord_summary(season_name: str, changes: list, errors: int):
             if r.get("penalties"):
                 n = r["penalties"]
                 parts.append(f"{n} Strafe{'n' if n != 1 else ''} aktualisiert")
-            if r.get("version_updated"):
-                parts.append("Spielversion aktualisiert")
-            if not parts:
-                parts.append("Ergebnisse aktualisiert")
-            lines.append(f"  🔄 Rennen {rn} – {', '.join(parts)}")
-
-        if r.get("new"):
-            lines.append(
-                f"  ✅ Rennen {rn} erfasst – {track}"
-                + (f" ({date_str})" if date_str else "")
-                + f", {r['drivers']} Fahrer"
-            )
-        else:
-            parts = []
-            if r.get("penalties"):
-                n = r["penalties"]
-                parts.append(f"{n} Strafe{'n' if n != 1 else ''} aktualisiert")
+            if r.get("ratings_updated"):
+                n = r["ratings_updated"]
+                parts.append(f"{n} Rating{'s' if n != 1 else ''} aktualisiert")
+            if r.get("grid_pos_inserted"):
+                n = r["grid_pos_inserted"]
+                parts.append(f"{n} Gridposition{'en' if n != 1 else ''} eingetragen")
             if r.get("version_updated"):
                 parts.append("Spielversion aktualisiert")
             if not parts:
