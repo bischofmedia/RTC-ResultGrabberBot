@@ -293,13 +293,89 @@ def lookup_vehicle(cur, name: str):
     return None
 
 
-def lookup_race(cur, season_id: int, race_number: int):
+def lookup_track(cur, sheet_name: str):
+    """Sucht track_id anhand von tracks.sheet_name (exakt, dann getrimmt)."""
+    if not sheet_name:
+        return None
+    cur.execute("SELECT track_id FROM tracks WHERE sheet_name = %s", (sheet_name,))
+    row = cur.fetchone()
+    if row:
+        return row["track_id"]
+    # Getrimmt versuchen (fuehrende/nachfolgende Leerzeichen im Sheet)
+    cur.execute("SELECT track_id FROM tracks WHERE TRIM(sheet_name) = %s", (sheet_name.strip(),))
+    row = cur.fetchone()
+    if row:
+        return row["track_id"]
+    log.warning(f"  Strecke nicht gefunden: '{sheet_name}'")
+    return None
+
+
+def lookup_version_id(cur, race_date) -> int:
+    """
+    Ermittelt die passende version_id fuer GT7 zum Renndatum:
+    Letzter GT7-Patch, dessen release_date <= race_date.
+    """
+    if not race_date:
+        # Fallback: neueste GT7-Version
+        cur.execute(
+            "SELECT version_id FROM game_versions "
+            "WHERE game = 'Gran Turismo 7' ORDER BY release_date DESC LIMIT 1"
+        )
+    else:
+        cur.execute(
+            "SELECT version_id FROM game_versions "
+            "WHERE game = 'Gran Turismo 7' AND release_date <= %s "
+            "ORDER BY release_date DESC LIMIT 1",
+            (race_date,)
+        )
+    row = cur.fetchone()
+    if row:
+        return row["version_id"]
+    # Absoluter Fallback: erste GT7-Version
+    cur.execute(
+        "SELECT version_id FROM game_versions "
+        "WHERE game = 'Gran Turismo 7' ORDER BY release_date ASC LIMIT 1"
+    )
+    row = cur.fetchone()
+    return row["version_id"] if row else 62  # 62 = GT7 1.05 Release
+
+
+def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict):
+    """
+    Gibt race_id zurueck. Legt races-Eintrag an wenn nicht vorhanden.
+    Benoetigt track_name und race_date aus data.
+    """
     cur.execute(
         "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
         (season_id, race_number),
     )
     row = cur.fetchone()
-    return row["race_id"] if row else None
+    if row:
+        return row["race_id"]
+
+    # Neu anlegen
+    track_id   = lookup_track(cur, data["track_name"])
+    version_id = lookup_version_id(cur, data["race_date"])
+
+    if not track_id:
+        log.error(
+            f"  Rennen {race_number}: Strecke '{data['track_name']}' nicht in DB "
+            f"(sheet_name-Spalte pruefen). Rennen kann nicht angelegt werden."
+        )
+        return None
+
+    cur.execute(
+        """INSERT INTO races
+           (season_id, track_id, version_id, race_number, race_date)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (season_id, track_id, version_id, race_number, data["race_date"]),
+    )
+    race_id = cur.lastrowid
+    log.info(
+        f"  Rennen {race_number} neu angelegt: race_id={race_id}, "
+        f"track_id={track_id}, version_id={version_id}, date={data['race_date']}"
+    )
+    return race_id
 
 
 def lookup_grid(cur, race_id: int, grid_number: str):
@@ -453,12 +529,8 @@ def parse_race_sheet(rows: list):
 # ── DB-Import ─────────────────────────────────────────────────────────────────
 
 def import_race(cur, season_id: int, race_number: int, data: dict):
-    race_id = lookup_race(cur, season_id, race_number)
+    race_id = lookup_or_create_race(cur, season_id, race_number, data)
     if not race_id:
-        log.warning(
-            f"  Rennen {race_number} (season_id={season_id}) nicht in DB. "
-            f"Bitte zuerst in 'races' anlegen. Uebersprungen."
-        )
         return False
 
     log.info(f"  race_id={race_id} | {len(data['entries'])} Fahrer | "
