@@ -733,11 +733,12 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
 
     # Alten Stand fuer Change-Detection lesen (vor dem Loeschen)
     cur.execute(
-        "SELECT driver_id, penalty_seconds FROM race_results WHERE race_id = %s",
+        "SELECT driver_id, penalty_seconds, finish_pos_overall, points_total "
+        "FROM race_results WHERE race_id = %s",
         (race_id,)
     )
-    old_rows        = {r["driver_id"]: r["penalty_seconds"] for r in cur.fetchall()}
-    old_driver_ids  = set(old_rows.keys())
+    old_rows = {r["driver_id"]: r for r in cur.fetchall()}
+    old_count = len(old_rows)
 
     # Bestehende Ergebnisse loeschen (bonus_points zuerst wegen FK)
     cur.execute(
@@ -751,8 +752,8 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
     grid_numbers_needed = {e["grid_number"] for e in data["entries"] if e["grid_number"]}
     ensure_grids(cur, race_id, grid_numbers_needed)
 
-    inserted        = 0
-    new_penalties   = 0  # Fahrer mit Strafe die vorher keine hatten (oder mehr Strafe)
+    inserted      = 0
+    new_penalties = 0  # Strafen die neu sind oder sich geaendert haben
 
     for entry in data["entries"]:
         psn  = entry["psn_name"]
@@ -836,16 +837,26 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
         # Change-Detection: Strafe neu oder geaendert?
         pen = entry["penalty_sec"] or 0
         if pen > 0:
-            old_pen = old_rows.get(d_id, 0) or 0
+            old_pen = (old_rows.get(d_id) or {}).get("penalty_seconds") or 0
             if old_pen != pen:
                 new_penalties += 1
 
         inserted += 1
 
-    log.info(f"  ✓ {inserted} Fahrer eingetragen.")
+    # Echte Aenderung: neue Fahrer, Strafen geaendert, oder Spielversion geaendert
+    something_changed = (
+        is_new_race
+        or version_updated
+        or new_penalties > 0
+        or inserted != old_count
+    )
+
+    log.info(f"  ✓ {inserted} Fahrer eingetragen."
+             + (" (keine Aenderung)" if not something_changed else ""))
     return {
         "new":             is_new_race,
         "version_updated": version_updated,
+        "changed":         something_changed,
         "drivers":         inserted,
         "penalties":       new_penalties,
         "track":           data["track_name"],
@@ -988,7 +999,8 @@ def main():
                 errors += 1
             else:
                 imported += 1
-                changes.append((race_number, result))
+                if result.get("changed"):
+                    changes.append((race_number, result))
 
         db.commit()
         log.info(
