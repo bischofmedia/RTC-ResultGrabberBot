@@ -3,34 +3,29 @@
 rtc_import_results.py
 ─────────────────────
 Liest Rennergebnisse aus dem Google Sheet einer RTC-Saison
-und schreibt sie in die MariaDB (upsert).
+und schreibt sie in die MariaDB (upsert: loeschen + neu eintragen).
 
 Verwendung:
-  python3 rtc_import_results.py               # aktive Saison
-  python3 rtc_import_results.py --season 12   # bestimmte Saison
-  python3 rtc_import_results.py --race 3      # nur Rennen 3 (aktive Saison)
+  python3 rtc_import_results.py               # aktive Saison, alle Rennen
+  python3 rtc_import_results.py --season 12   # bestimmte Saison, alle Rennen
+  python3 rtc_import_results.py --race 3      # aktive Saison, nur Rennen 3
   python3 rtc_import_results.py --season 12 --race 3
 
-Automatischer Start:
-  Cron: 0 2 * * 2 /usr/bin/python3 /home/ubuntu/RTC_RaceResultBot/rtc_import_results.py
-  (02:00 UTC = 03:00/04:00 Berliner Zeit je nach Sommerzeit)
-  Trigger aus RaceResultBot: subprocess.run(['python3', SCRIPT_PATH])
+Cron (4 Uhr Berlin = 2 Uhr UTC, laeuft dienstags nach dem Rennen):
+  0 2 * * 2 /usr/bin/python3 /home/ubuntu/RTC_RaceResultBot/rtc_import_results.py
 """
 
 import os
 import re
 import sys
-import json
 import logging
 import argparse
-import subprocess
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
 import pymysql
+from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
 
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
@@ -43,7 +38,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME     = os.getenv("DB_NAME")
 CREDS_PATH  = os.getenv("GOOGLE_CREDENTIALS")
 
-BERLIN = ZoneInfo("Europe/Berlin")
+# Bonus-Typen (entsprechen bonus_type in bonus_points-Tabelle)
+BONUS_FL      = "FL"   # Schnellste Runde
+BONUS_PODIUM  = "POD"  # Podium
+BONUS_SR      = "SR"   # Seltenes Fahrzeug
+BONUS_FT      = "FT"   # Fahrzeugtreue
+
+# DNF-Marker im Sheet
+DNF_MARKER = "8:00:00"
 
 # Logging
 logging.basicConfig(
@@ -51,19 +53,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/home/ubuntu/RTC_RaceResultBot/rtc_import_results.log"),
+        logging.FileHandler(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "rtc_import_results.log")
+        ),
     ],
 )
 log = logging.getLogger("rtc_import")
-
-# DNF-Marker im Sheet
-DNF_TIME = "8:00:00,000"
-
-# Bonus-Typen
-BONUS_FASTEST_LAP    = "FL"   # schnellste Runde
-BONUS_PODIUM         = "POD"  # Podium
-BONUS_RARE_VEHICLE   = "SR"   # seltenes Fahrzeug
-BONUS_VEHICLE_LOYALTY = "FT"  # Fahrzeugtreue
 
 
 # ── Datenbank ─────────────────────────────────────────────────────────────────
@@ -87,8 +83,7 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def fetch_sheet(service, sheet_id: str, tab: str) -> list[list]:
-    """Gibt alle Zellen des Tabellenblatts zurück (als 2D-Liste)."""
+def fetch_sheet(service, sheet_id: str, tab: str) -> list:
     result = (
         service.spreadsheets()
         .values()
@@ -98,7 +93,7 @@ def fetch_sheet(service, sheet_id: str, tab: str) -> list[list]:
     return result.get("values", [])
 
 
-def list_sheet_tabs(service, sheet_id: str) -> list[str]:
+def list_sheet_tabs(service, sheet_id: str) -> list:
     meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     return [s["properties"]["title"] for s in meta["sheets"]]
 
@@ -106,98 +101,134 @@ def list_sheet_tabs(service, sheet_id: str) -> list[str]:
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
 def cell(row: list, idx: int, default="") -> str:
-    """Gibt Zellinhalt zurück, stripped; leer wenn nicht vorhanden."""
     try:
         return str(row[idx]).strip()
     except IndexError:
         return default
 
 
-def parse_time_to_seconds(t: str) -> float | None:
+def parse_time_to_seconds(t: str):
     """
-    Konvertiert Zeitstring  H:MM:SS,mmm  oder  M:SS,mmm  in Sekunden.
-    Gibt None zurück wenn DNF oder leer.
+    Konvertiert 'H:MM:SS,mmm' oder 'M:SS,mmm' in Sekunden (float).
+    Gibt None zurueck bei leer, DNF oder Fehler.
     """
-    if not t or t == DNF_TIME:
+    if not t:
         return None
+    # Komma als Dezimaltrenner -> Punkt
     t = t.replace(",", ".")
     parts = t.split(":")
     try:
         if len(parts) == 3:
-            h, m, s = parts
-            return int(h) * 3600 + int(m) * 60 + float(s)
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
         elif len(parts) == 2:
-            m, s = parts
-            return int(m) * 60 + float(s)
+            return int(parts[0]) * 60 + float(parts[1])
         else:
             return float(parts[0])
-    except ValueError:
+    except (ValueError, IndexError):
         return None
+
+
+def seconds_to_timestr(sec) -> str:
+    """Konvertiert Sekunden zurueck in 'H:MM:SS,mmm'."""
+    if sec is None:
+        return None
+    h  = int(sec // 3600)
+    m  = int((sec % 3600) // 60)
+    s  = sec % 60
+    ms = round((s - int(s)) * 1000)
+    if ms == 1000:
+        ms = 0
+        s_int = int(s) + 1
+    else:
+        s_int = int(s)
+    return f"{h}:{m:02d}:{s_int:02d},{ms:03d}"
 
 
 def parse_penalty_seconds(s: str) -> int:
     """'+10s' oder '10s' oder '10' → 10; leer → 0."""
     if not s:
         return 0
-    s = s.strip().lstrip("+").rstrip("s").strip()
+    cleaned = s.strip().lstrip("+").rstrip("sS").strip()
     try:
-        return int(s)
+        return int(cleaned)
     except ValueError:
         return 0
 
 
-def parse_base_points(raw: str) -> tuple[int, int, int]:
+def parse_base_points(raw: str):
     """
-    Spalte M: z.B.  '¹ 59 ²'  '60 ³'  '58 ¹'  '57'
-    Superscript vorne = Schnellste-Runde-Bonus-Indikator (Wert egal, nur Flag)
-    Zahl in der Mitte = Basispunkte
-    Superscript hinten = Podium-Bonuspunkte (der Wert selbst)
+    Spalte M: z.B. '¹ 59 ²'  '60 ³'  '58 ¹'  '57'
 
-    Gibt zurück: (base_points, fl_flag 0/1, podium_bonus_points)
+    Hochgestellte Ziffern vorne  = Schnellste-Runde-Flag (Wert egal)
+    Hauptzahl in der Mitte/allein = Basispunkte
+    Hochgestellte Ziffern hinten  = Podium-Bonuspunkte (der Wert)
+
+    Rueckgabe: (base_points: int, fl_flag: int 0/1, podium_bonus: int)
     """
-    # Superscript-Zeichen → normale Ziffern
-    sup_map = str.maketrans("¹²³⁴⁵⁶⁷⁸⁹⁰", "1234567890 ")
-    cleaned = raw.translate(sup_map).strip()
+    if not raw:
+        return 0, 0, 0
 
-    # Teile aufsplitten: optional führende Zahl, Basispunkte, optional hintere Zahl
-    # Format kann sein: "1 59 2"  "60 3"  "58 1"  "57"
-    tokens = cleaned.split()
-    tokens = [t for t in tokens if t.isdigit()]
+    # Superscript-Zeichen erkennen
+    SUPERSCRIPT = set("¹²³⁴⁵⁶⁷⁸⁹⁰")
+    SUP_TO_NUM  = str.maketrans("¹²³⁴⁵⁶⁷⁸⁹⁰", "1234567890")
+
+    # Hat die Zeichenkette einen fuehrenden Superscript?
+    has_leading_sup = bool(raw) and raw[0] in SUPERSCRIPT
+
+    # Alle "Token-Gruppen" extrahieren: normale Ziffernfolgen vs. Superscript-Folgen
+    # Wir brauchen nur die Zahlen in Reihenfolge und ob sie hochgestellt sind
+    tokens = []  # Liste von (wert: int, is_superscript: bool)
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch in SUPERSCRIPT:
+            j = i
+            while j < len(raw) and raw[j] in SUPERSCRIPT:
+                j += 1
+            num_str = raw[i:j].translate(SUP_TO_NUM)
+            try:
+                tokens.append((int(num_str), True))
+            except ValueError:
+                pass
+            i = j
+        elif ch.isdigit():
+            j = i
+            while j < len(raw) and raw[j].isdigit():
+                j += 1
+            tokens.append((int(raw[i:j]), False))
+            i = j
+        else:
+            i += 1
 
     if not tokens:
         return 0, 0, 0
 
-    # Wenn genau ein Token → nur Basispunkte, kein Bonus
-    if len(tokens) == 1:
-        return int(tokens[0]), 0, 0
+    # Auswertung:
+    # Moegliche Formate:
+    #   [norm]                         → base=norm, fl=0, pod=0
+    #   [norm, sup]                    → base=norm, fl=0, pod=sup
+    #   [sup, norm]                    → fl=1, base=norm, pod=0
+    #   [sup, norm, sup]               → fl=1, base=norm, pod=sup2
 
-    # Originaler Raw-String prüfen: führt er mit Superscript-Zeichen?
-    has_leading_sup = raw[0] in "¹²³⁴⁵⁶⁷⁸⁹"
+    normal = [(v, s) for v, s in tokens if not s]
+    super_ = [(v, s) for v, s in tokens if s]
 
-    if has_leading_sup and len(tokens) >= 2:
-        # erstes Token = FL-Bonus-Indikator (ignorieren als Zahl, nur Flag setzen)
-        # letztes Token = Podium-Bonus, Token davor = Basispunkte
-        if len(tokens) == 2:
-            base = int(tokens[1])
-            podium = 0
-            fl_flag = 1
-        else:  # 3 tokens
-            base = int(tokens[1])
-            podium = int(tokens[2])
-            fl_flag = 1
+    if has_leading_sup:
+        fl_flag   = 1
+        base      = normal[0][0] if normal else 0
+        # Podium = letzter Superscript (wenn mehr als einer vorhanden)
+        trailing  = [v for v, _ in super_[1:]] if len(super_) > 1 else []
+        pod_bonus = trailing[-1] if trailing else 0
     else:
-        # kein führender Superscript
-        base = int(tokens[0])
-        podium = int(tokens[1]) if len(tokens) > 1 else 0
-        fl_flag = 0
+        fl_flag   = 0
+        base      = normal[0][0] if normal else 0
+        pod_bonus = super_[-1][0] if super_ else 0
 
-    return base, fl_flag, podium
+    return base, fl_flag, pod_bonus
 
 
-def parse_car_bonus(raw: str) -> tuple[int, int]:
-    """
-    Spalte N: '2/0' → (rare_vehicle=2, vehicle_loyalty=0)
-    """
+def parse_car_bonus(raw: str):
+    """'2/0' → (rare=2, loyalty=0); leer → (0,0)."""
     if not raw or "/" not in raw:
         return 0, 0
     parts = raw.split("/")
@@ -207,18 +238,18 @@ def parse_car_bonus(raw: str) -> tuple[int, int]:
         return 0, 0
 
 
-# ── DB-Lookup-Funktionen ──────────────────────────────────────────────────────
+# ── DB-Lookup ─────────────────────────────────────────────────────────────────
 
-def lookup_driver(cur, psn_name: str) -> int | None:
+def lookup_driver(cur, psn_name: str):
     cur.execute("SELECT driver_id FROM drivers WHERE psn_name = %s", (psn_name,))
     row = cur.fetchone()
     return row["driver_id"] if row else None
 
 
 def lookup_or_create_driver(cur, psn_name: str) -> int:
-    driver_id = lookup_driver(cur, psn_name)
-    if driver_id:
-        return driver_id
+    did = lookup_driver(cur, psn_name)
+    if did:
+        return did
     log.info(f"  Neuer Fahrer angelegt: {psn_name}")
     cur.execute(
         "INSERT INTO drivers (psn_name, is_active) VALUES (%s, 1)", (psn_name,)
@@ -226,44 +257,43 @@ def lookup_or_create_driver(cur, psn_name: str) -> int:
     return cur.lastrowid
 
 
-def lookup_team(cur, team_name: str) -> int | None:
-    if not team_name:
+def lookup_team(cur, name: str):
+    if not name:
         return None
-    cur.execute("SELECT team_id FROM teams WHERE name = %s", (team_name,))
+    cur.execute("SELECT team_id FROM teams WHERE name = %s", (name,))
     row = cur.fetchone()
     if row:
         return row["team_id"]
-    # Fuzzy: LIKE
-    cur.execute("SELECT team_id, name FROM teams WHERE name LIKE %s", (f"%{team_name}%",))
-    row = cur.fetchone()
-    if row:
-        log.warning(f"  Team fuzzy-match: '{team_name}' → '{row['name']}'")
-        return row["team_id"]
-    log.warning(f"  Team nicht gefunden: '{team_name}'")
-    return None
-
-
-def lookup_vehicle(cur, vehicle_name: str) -> int | None:
-    if not vehicle_name:
-        return None
-    cur.execute("SELECT vehicle_id FROM vehicles WHERE name = %s", (vehicle_name,))
-    row = cur.fetchone()
-    if row:
-        return row["vehicle_id"]
     # Fuzzy
-    cur.execute(
-        "SELECT vehicle_id, name FROM vehicles WHERE name LIKE %s LIMIT 1",
-        (f"%{vehicle_name[:10]}%",),
-    )
+    cur.execute("SELECT team_id, name FROM teams WHERE name LIKE %s LIMIT 1",
+                (f"%{name}%",))
     row = cur.fetchone()
     if row:
-        log.warning(f"  Fahrzeug fuzzy-match: '{vehicle_name}' → '{row['name']}'")
-        return row["vehicle_id"]
-    log.warning(f"  Fahrzeug nicht gefunden: '{vehicle_name}'")
+        log.warning(f"  Team fuzzy: '{name}' → '{row['name']}'")
+        return row["team_id"]
+    log.warning(f"  Team nicht gefunden: '{name}'")
     return None
 
 
-def lookup_race(cur, season_id: int, race_number: int) -> int | None:
+def lookup_vehicle(cur, name: str):
+    if not name:
+        return None
+    cur.execute("SELECT vehicle_id FROM vehicles WHERE name = %s", (name,))
+    row = cur.fetchone()
+    if row:
+        return row["vehicle_id"]
+    # Fuzzy: erste 12 Zeichen
+    cur.execute("SELECT vehicle_id, name FROM vehicles WHERE name LIKE %s LIMIT 1",
+                (f"%{name[:12]}%",))
+    row = cur.fetchone()
+    if row:
+        log.warning(f"  Fahrzeug fuzzy: '{name}' → '{row['name']}'")
+        return row["vehicle_id"]
+    log.warning(f"  Fahrzeug nicht gefunden: '{name}'")
+    return None
+
+
+def lookup_race(cur, season_id: int, race_number: int):
     cur.execute(
         "SELECT race_id FROM races WHERE season_id = %s AND race_number = %s",
         (season_id, race_number),
@@ -272,7 +302,7 @@ def lookup_race(cur, season_id: int, race_number: int) -> int | None:
     return row["race_id"] if row else None
 
 
-def lookup_grid(cur, race_id: int, grid_number: str) -> int | None:
+def lookup_grid(cur, race_id: int, grid_number: str):
     cur.execute(
         "SELECT grid_id FROM grids WHERE race_id = %s AND grid_number = %s",
         (race_id, grid_number),
@@ -283,138 +313,140 @@ def lookup_grid(cur, race_id: int, grid_number: str) -> int | None:
 
 # ── Sheet-Parsing ─────────────────────────────────────────────────────────────
 
-def parse_race_sheet(rows: list[list]) -> dict | None:
+def parse_race_sheet(rows: list):
     """
-    Liest ein Renn-Tabellenblatt und gibt ein Dict zurück:
-    {
-      'race_date': date,
-      'track_name': str,
-      'fastest_lap_time': str,
-      'fastest_lap_psn': str,
-      'entries': [ {driver, team, vehicle, livery, grid_number,
-                    penalty_sec, penalty_pts, race_time_final,
-                    base_points, fl_flag, podium_bonus,
-                    rare_vehicle_bonus, vehicle_loyalty_bonus, points_total,
-                    finish_pos, status} ]
-    }
-    Gibt None zurück wenn das Blatt leer/unvollständig ist.
+    Parst ein Rennen-Tabellenblatt.
+
+    Layout (0-basierte Zeilen-/Spaltenindizes):
+      Zeile 1 (idx 1): Spalte 3 (D) = Streckenname (merged E2:K2, Index 3 in 0-Basis)
+      Zeile 2 (idx 2): Spalte 4 (E) = Datum, Spalte 6 (G) = Schnellste Runde,
+                        Spalte 8 (I) = Fahrer Schnellste Runde
+      Ab Zeile 6 (idx 6): Fahrerdaten
+        Spalte 1 = Pos, 3 = Driver, 4 = Team, 5 = Car, 6 = Livery,
+        7 = Grid, 8 = Penalty, 9 = PenaltyPoints, 10 = RaceTime (final),
+        12 = Punkte (Basis+Boni hochgestellt), 13 = Car-Bonus, 14 = Gesamt
+
+    Rueckgabe: dict oder None wenn leer.
     """
 
-    def r(row_idx, col_idx):
+    def r(row_idx, col_idx, default=""):
         try:
             return str(rows[row_idx][col_idx]).strip()
         except (IndexError, TypeError):
-            return ""
+            return default
 
-    # Zeile 3 (Index 2): Datum E3, Schnellste Runde G3, Fahrer I3
-    # Zeile 2 (Index 1): Strecke E2 (merged E2:K2)
-    try:
-        track_name    = r(1, 3)   # E2 (Spalte-Index 3 = D, aber Sheet-Cols sind 0-basiert)
-        race_date_str = r(2, 4)   # E3
-        fastest_lap   = r(2, 6)   # G3
-        fastest_lap_driver = r(2, 8)  # I3
-    except Exception:
-        return None
+    # Metadaten
+    track_name    = r(1, 3)   # Spalte D in Zeile 2
+    race_date_str = r(2, 4)   # Spalte E in Zeile 3
+    fastest_lap   = r(2, 6)   # Spalte G in Zeile 3
+    fl_driver_psn = r(2, 8)   # Spalte I in Zeile 3
 
     if not track_name and not race_date_str:
         return None
 
-    # Datum parsen: DD.MM.YYYY
     race_date = None
     if race_date_str:
-        try:
-            race_date = datetime.strptime(race_date_str, "%d.%m.%Y").date()
-        except ValueError:
-            log.warning(f"  Datum konnte nicht geparst werden: '{race_date_str}'")
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                race_date = datetime.strptime(race_date_str, fmt).date()
+                break
+            except ValueError:
+                pass
+        if not race_date:
+            log.warning(f"  Datum nicht parsbar: '{race_date_str}'")
 
-    # Schnellste Runde in Sekunden (für Rating-Berechnung)
-    fl_seconds = parse_time_to_seconds(fastest_lap.replace(".", ",").replace(",", ","))
-    # Sheet nutzt Komma als Dezimaltrenner: '1:52,941'
     fl_seconds = parse_time_to_seconds(fastest_lap)
 
     entries = []
-    # Daten ab Zeile 7 (Index 6)
-    for row in rows[6:]:
+    for row in rows[6:]:  # ab Zeile 7 (Index 6)
         pos_raw = cell(row, 1)
         if not pos_raw or not pos_raw.isdigit():
-            continue  # Leerzeile oder Kopfzeile
+            continue
 
-        finish_pos    = int(pos_raw)
-        psn_name      = cell(row, 3)
-        team_name     = cell(row, 4)
-        vehicle_name  = cell(row, 5)
-        livery_raw    = cell(row, 6)
-        grid_raw      = cell(row, 7)
-        penalty_raw   = cell(row, 8)
-        penalty_pts   = int(cell(row, 9) or 0)
+        finish_pos   = int(pos_raw)
+        psn_name     = cell(row, 3)
+        team_name    = cell(row, 4)
+        vehicle_name = cell(row, 5)
+        livery_code  = cell(row, 6)
+        grid_number  = cell(row, 7)
+        penalty_raw  = cell(row, 8)
+        penalty_pts  = cell(row, 9)
         race_time_raw = cell(row, 10)
-        points_raw    = cell(row, 12)
+        points_raw   = cell(row, 12)
         car_bonus_raw = cell(row, 13)
-        points_total  = int(cell(row, 14) or 0)
+        points_total = cell(row, 14)
 
         if not psn_name:
             continue
 
-        # Status
-        is_dnf = (race_time_raw == DNF_TIME or race_time_raw.startswith("8:00:00"))
+        # DNF erkennen
+        is_dnf = (not race_time_raw
+                  or race_time_raw.startswith(DNF_MARKER)
+                  or race_time_raw.upper() == "DNF")
         status = "DNF" if is_dnf else "FIN"
 
-        # Renndauer in Sekunden (ohne Strafe)
+        # Zeiten
         race_time_sec = parse_time_to_seconds(race_time_raw) if not is_dnf else None
+        penalty_sec   = parse_penalty_seconds(penalty_raw)
 
-        # Rating = RaceTime(ohne Strafe) / FastestLap
-        # Hinweis: race_time_final enthält bereits Strafe;
-        # race_time_raw = Endzeit mit Strafe laut Beschreibung (Spalte K = final)
-        # Rating wird über Zeit-ohne-Strafe berechnet:
-        penalty_sec = parse_penalty_seconds(penalty_raw)
-        race_time_no_penalty_sec = None
-        if race_time_sec is not None and penalty_sec:
-            race_time_no_penalty_sec = race_time_sec - penalty_sec
-        elif race_time_sec is not None:
-            race_time_no_penalty_sec = race_time_sec
+        # Zeit ohne Strafe (fuer Rating-Berechnung)
+        if race_time_sec is not None:
+            time_no_penalty = race_time_sec - penalty_sec if penalty_sec else race_time_sec
+        else:
+            time_no_penalty = None
 
+        # Rating = RaceTime_ohne_Strafe / Schnellste_Runde
         rating = None
-        if race_time_no_penalty_sec and fl_seconds:
-            rating = round(race_time_no_penalty_sec / fl_seconds, 4)
+        if time_no_penalty and fl_seconds and fl_seconds > 0:
+            rating = round(time_no_penalty / fl_seconds, 4)
 
-        # Punkte parsen
-        base_pts, fl_flag, podium_bonus = parse_base_points(points_raw)
-        rare_bonus, loyalty_bonus = parse_car_bonus(car_bonus_raw)
+        # Punkte
+        base_pts, fl_flag, pod_bonus = parse_base_points(points_raw)
+        rare_bonus, loyalty_bonus    = parse_car_bonus(car_bonus_raw)
 
-        # Livery-Code (nur Grid-Nummer ist relevant für Lookup)
-        grid_number = grid_raw  # '1', '2', '3' etc.
+        try:
+            pts_total = int(points_total)
+        except (ValueError, TypeError):
+            pts_total = 0
+
+        try:
+            pen_pts = int(penalty_pts)
+        except (ValueError, TypeError):
+            pen_pts = 0
 
         entries.append({
-            "finish_pos":           finish_pos,
-            "psn_name":             psn_name,
-            "team_name":            team_name,
-            "vehicle_name":         vehicle_name,
-            "livery_code":          livery_raw,
-            "grid_number":          grid_number,
-            "penalty_sec":          penalty_sec,
-            "penalty_pts":          penalty_pts,
-            "race_time_final":      race_time_raw if not is_dnf else None,
-            "race_time_no_penalty": race_time_no_penalty_sec,
-            "rating":               rating,
-            "base_points":          base_pts,
-            "fl_flag":              fl_flag,
-            "podium_bonus":         podium_bonus,
-            "rare_bonus":           rare_bonus,
-            "loyalty_bonus":        loyalty_bonus,
-            "points_total":         points_total,
-            "status":               status,
+            "finish_pos":        finish_pos,
+            "psn_name":          psn_name,
+            "team_name":         team_name,
+            "vehicle_name":      vehicle_name,
+            "livery_code":       livery_code or None,
+            "grid_number":       grid_number,
+            "penalty_sec":       penalty_sec,
+            "penalty_pts":       pen_pts,
+            # race_time = Zeit ohne Strafe (Roh-Rennzeit)
+            "race_time":         seconds_to_timestr(time_no_penalty) if time_no_penalty else None,
+            # race_time_final = Zeit mit Strafe (wie im Sheet in Spalte K)
+            "race_time_final":   race_time_raw if not is_dnf else None,
+            "rating":            rating,
+            "base_points":       base_pts,
+            "fl_flag":           fl_flag,
+            "podium_bonus":      pod_bonus,
+            "rare_bonus":        rare_bonus,
+            "loyalty_bonus":     loyalty_bonus,
+            "points_total":      pts_total,
+            "status":            status,
         })
 
     if not entries:
         return None
 
     return {
-        "race_date":          race_date,
-        "track_name":         track_name,
-        "fastest_lap_time":   fastest_lap,
-        "fastest_lap_psn":    fastest_lap_driver,
-        "fl_seconds":         fl_seconds,
-        "entries":            entries,
+        "race_date":        race_date,
+        "track_name":       track_name,
+        "fastest_lap_time": fastest_lap,
+        "fl_driver_psn":    fl_driver_psn,
+        "fl_seconds":       fl_seconds,
+        "entries":          entries,
     }
 
 
@@ -423,93 +455,106 @@ def parse_race_sheet(rows: list[list]) -> dict | None:
 def import_race(cur, season_id: int, race_number: int, data: dict):
     race_id = lookup_race(cur, season_id, race_number)
     if not race_id:
-        log.warning(f"  Rennen {race_number} (season {season_id}) nicht in DB – übersprungen.")
-        log.warning(f"  Bitte Rennen zuerst in der 'races'-Tabelle anlegen.")
-        return
+        log.warning(
+            f"  Rennen {race_number} (season_id={season_id}) nicht in DB. "
+            f"Bitte zuerst in 'races' anlegen. Uebersprungen."
+        )
+        return False
 
-    log.info(f"  race_id={race_id}, {len(data['entries'])} Fahrer")
+    log.info(f"  race_id={race_id} | {len(data['entries'])} Fahrer | "
+             f"Datum={data['race_date']} | Strecke={data['track_name']}")
 
-    # Fastest-Lap-Fahrer-ID für races-Update
+    # Fastest-Lap-Fahrer-ID
     fl_driver_id = None
-    if data["fastest_lap_psn"]:
-        fl_driver_id = lookup_driver(cur, data["fastest_lap_psn"])
+    if data["fl_driver_psn"]:
+        fl_driver_id = lookup_driver(cur, data["fl_driver_psn"])
+        if not fl_driver_id:
+            log.warning(f"  FL-Fahrer '{data['fl_driver_psn']}' nicht in DB.")
 
-    # races-Tabelle updaten (Datum, Fastest Lap)
+    # races-Tabelle: Datum und Schnellste-Runde aktualisieren
     cur.execute(
         """UPDATE races SET
-             fastest_lap_time = %s,
-             fastest_lap_driver_id = %s
+             race_date              = COALESCE(%s, race_date),
+             fastest_lap_time       = %s,
+             fastest_lap_driver_id  = %s
            WHERE race_id = %s""",
-        (data["fastest_lap_time"], fl_driver_id, race_id),
+        (data["race_date"], data["fastest_lap_time"], fl_driver_id, race_id),
     )
 
-    # Bestehende Ergebnisse dieses Rennens löschen (clean upsert)
-    cur.execute("DELETE FROM bonus_points WHERE result_id IN "
-                "(SELECT result_id FROM race_results WHERE race_id = %s)", (race_id,))
+    # Bestehende Ergebnisse loeschen (bonus_points zuerst wegen FK)
+    cur.execute(
+        "DELETE FROM bonus_points WHERE result_id IN "
+        "(SELECT result_id FROM race_results WHERE race_id = %s)",
+        (race_id,)
+    )
     cur.execute("DELETE FROM race_results WHERE race_id = %s", (race_id,))
 
+    inserted = 0
     for entry in data["entries"]:
-        psn   = entry["psn_name"]
-        d_id  = lookup_or_create_driver(cur, psn)
-        t_id  = lookup_team(cur, entry["team_name"])
-        v_id  = lookup_vehicle(cur, entry["vehicle_name"])
-
-        # Grid-ID: grid_number aus Sheet (1/2/3)
+        psn  = entry["psn_name"]
+        d_id = lookup_or_create_driver(cur, psn)
+        t_id = lookup_team(cur, entry["team_name"])
+        v_id = lookup_vehicle(cur, entry["vehicle_name"])
         g_id = lookup_grid(cur, race_id, entry["grid_number"])
-        if not g_id:
-            log.warning(f"  Grid {entry['grid_number']} für race_id={race_id} nicht gefunden")
 
-        bonus_total = (entry["fl_flag"] +        # FL-Bonus-Wert wird aus bonus_fastest_lap gezählt
-                       entry["podium_bonus"] +
-                       entry["rare_bonus"] +
-                       entry["loyalty_bonus"])
+        if not g_id:
+            log.warning(
+                f"  Grid '{entry['grid_number']}' fuer race_id={race_id} "
+                f"nicht gefunden (Fahrer: {psn})."
+            )
+
+        bonus_total = (entry["fl_flag"] + entry["podium_bonus"]
+                       + entry["rare_bonus"] + entry["loyalty_bonus"])
 
         cur.execute(
             """INSERT INTO race_results
                (race_id, grid_id, driver_id, vehicle_id, team_id,
-                finish_pos_overall, race_time, race_time_final,
-                time_percent, rating_at_race,
+                finish_pos_overall,
+                race_time, race_time_final,
+                rating_at_race,
                 points_base, bonus_total,
-                bonus_podium, bonus_fastest_lap,
+                bonus_fastest_lap, bonus_podium,
                 bonus_rare_vehicle, bonus_vehicle_loyalty,
                 points_total, status,
-                penalty_seconds, penalty_points, livery_code)
-               VALUES (%s,%s,%s,%s,%s,
-                       %s,%s,%s,
-                       %s,%s,
-                       %s,%s,
-                       %s,%s,
-                       %s,%s,
-                       %s,%s,
-                       %s,%s,%s)""",
+                penalty_seconds, penalty_points,
+                livery_code)
+               VALUES
+               (%s,%s,%s,%s,%s,
+                %s,
+                %s,%s,
+                %s,
+                %s,%s,
+                %s,%s,
+                %s,%s,
+                %s,%s,
+                %s,%s,
+                %s)""",
             (
                 race_id, g_id, d_id, v_id, t_id,
                 entry["finish_pos"],
-                # race_time = Zeit ohne Strafe (als String), race_time_final = mit Strafe
-                _seconds_to_timestr(entry["race_time_no_penalty"]),
+                entry["race_time"],
                 entry["race_time_final"],
-                None,               # time_percent – optional, nicht im Sheet
                 entry["rating"],
                 entry["base_points"],
                 bonus_total,
-                entry["podium_bonus"],
                 1 if entry["fl_flag"] else 0,
+                entry["podium_bonus"],
                 entry["rare_bonus"],
                 entry["loyalty_bonus"],
                 entry["points_total"],
                 entry["status"],
                 entry["penalty_sec"],
                 entry["penalty_pts"],
-                entry["livery_code"] or None,
+                entry["livery_code"],
             ),
         )
         result_id = cur.lastrowid
 
-        # Bonus-Einträge
+        # Bonus-Eintraege
         if entry["fl_flag"]:
             cur.execute(
                 "INSERT INTO bonus_points (result_id, bonus_type, points) VALUES (%s,%s,%s)",
-                (result_id, BONUS_FASTEST_LAP, 1),
+                (result_id, BONUS_FL, 1),
             )
         if entry["podium_bonus"]:
             cur.execute(
@@ -519,26 +564,17 @@ def import_race(cur, season_id: int, race_number: int, data: dict):
         if entry["rare_bonus"]:
             cur.execute(
                 "INSERT INTO bonus_points (result_id, bonus_type, points) VALUES (%s,%s,%s)",
-                (result_id, BONUS_RARE_VEHICLE, entry["rare_bonus"]),
+                (result_id, BONUS_SR, entry["rare_bonus"]),
             )
         if entry["loyalty_bonus"]:
             cur.execute(
                 "INSERT INTO bonus_points (result_id, bonus_type, points) VALUES (%s,%s,%s)",
-                (result_id, BONUS_VEHICLE_LOYALTY, entry["loyalty_bonus"]),
+                (result_id, BONUS_FT, entry["loyalty_bonus"]),
             )
+        inserted += 1
 
-    log.info(f"  ✓ Rennen {race_number} importiert ({len(data['entries'])} Einträge)")
-
-
-def _seconds_to_timestr(sec: float | None) -> str | None:
-    """Konvertiert Sekunden zurück in H:MM:SS,mmm Format."""
-    if sec is None:
-        return None
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
-    ms = round((s - int(s)) * 1000)
-    return f"{h}:{m:02d}:{int(s):02d},{ms:03d}"
+    log.info(f"  ✓ {inserted} Fahrer eingetragen.")
+    return True
 
 
 # ── Hauptprogramm ─────────────────────────────────────────────────────────────
@@ -548,7 +584,7 @@ def main():
     parser.add_argument("--season", type=int, default=None,
                         help="Season-ID (Standard: aktive Saison)")
     parser.add_argument("--race", type=int, default=None,
-                        help="Nur dieses Rennen importieren (1–16)")
+                        help="Nur dieses Rennen importieren (1-16)")
     args = parser.parse_args()
 
     db  = get_db()
@@ -557,10 +593,14 @@ def main():
     try:
         # Saison ermitteln
         if args.season:
-            cur.execute("SELECT season_id, name, sheet_id FROM seasons WHERE season_id = %s",
-                        (args.season,))
+            cur.execute(
+                "SELECT season_id, name, sheet_id FROM seasons WHERE season_id = %s",
+                (args.season,)
+            )
         else:
-            cur.execute("SELECT season_id, name, sheet_id FROM seasons WHERE is_active = 1")
+            cur.execute(
+                "SELECT season_id, name, sheet_id FROM seasons WHERE is_active = 1 LIMIT 1"
+            )
 
         season = cur.fetchone()
         if not season:
@@ -569,55 +609,64 @@ def main():
 
         season_id = season["season_id"]
         sheet_id  = season["sheet_id"]
-        log.info(f"Saison: {season['name']} (ID={season_id}), Sheet={sheet_id}")
 
         if not sheet_id:
-            log.error("Keine sheet_id in der seasons-Tabelle eingetragen!")
+            log.error(f"Keine sheet_id in seasons fuer Saison {season_id} hinterlegt!")
             sys.exit(1)
+
+        log.info(f"Saison: {season['name']} (ID={season_id}) | Sheet={sheet_id}")
 
         svc = get_sheets_service()
 
-        # Verfügbare Tabs ermitteln
+        # Verfuegbare numerische Tabs ermitteln
         tabs = list_sheet_tabs(svc, sheet_id)
-        race_tabs = sorted(
-            [t for t in tabs if t.isdigit()],
-            key=lambda x: int(x)
-        )
-        log.info(f"Gefundene Rennen-Tabs: {race_tabs}")
+        race_tabs = sorted([t for t in tabs if t.isdigit()], key=lambda x: int(x))
 
         if args.race:
-            race_tabs = [str(args.race)] if str(args.race) in race_tabs else []
-            if not race_tabs:
-                log.error(f"Tab '{args.race}' nicht im Sheet gefunden.")
+            if str(args.race) not in race_tabs:
+                log.error(f"Tab '{args.race}' nicht im Sheet gefunden (verfuegbar: {race_tabs}).")
                 sys.exit(1)
+            race_tabs = [str(args.race)]
+
+        log.info(f"Zu importierende Tabs: {race_tabs}")
 
         imported = 0
         skipped  = 0
+        errors   = 0
 
         for tab in race_tabs:
             race_number = int(tab)
-            log.info(f"── Verarbeite Tab '{tab}' (Rennen {race_number}) ──")
+            log.info(f"── Tab '{tab}' (Rennen {race_number}) ──────────────")
 
             rows = fetch_sheet(svc, sheet_id, tab)
             data = parse_race_sheet(rows)
 
             if not data:
-                log.info(f"  Tab '{tab}' leer oder kein Ergebnis – übersprungen.")
+                log.info(f"  Leer oder kein Ergebnis – uebersprungen.")
                 skipped += 1
                 continue
 
-            log.info(f"  Datum: {data['race_date']}, Strecke: {data['track_name']}")
-            log.info(f"  Schnellste Runde: {data['fastest_lap_time']} ({data['fastest_lap_psn']})")
-
-            import_race(cur, season_id, race_number, data)
-            imported += 1
+            ok = import_race(cur, season_id, race_number, data)
+            if ok:
+                imported += 1
+            else:
+                errors += 1
 
         db.commit()
-        log.info(f"✓ Import abgeschlossen: {imported} Rennen importiert, {skipped} übersprungen.")
+        log.info(
+            f"✓ Import abgeschlossen: {imported} importiert, "
+            f"{skipped} uebersprungen, {errors} Fehler."
+        )
+        if errors:
+            sys.exit(1)
 
+    except KeyboardInterrupt:
+        db.rollback()
+        log.info("Abgebrochen.")
+        sys.exit(0)
     except Exception as e:
         db.rollback()
-        log.exception(f"Fehler beim Import: {e}")
+        log.exception(f"Kritischer Fehler: {e}")
         sys.exit(1)
     finally:
         cur.close()
