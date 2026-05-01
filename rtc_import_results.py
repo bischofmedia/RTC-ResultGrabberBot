@@ -635,11 +635,6 @@ def parse_race_sheet(rows: list):
         else:
             time_no_penalty = None
 
-        # Rating = RaceTime_ohne_Strafe / Schnellste_Runde
-        rating = None
-        if time_no_penalty and fl_seconds and fl_seconds > 0:
-            rating = round(time_no_penalty / fl_seconds, 4)
-
         # Punkte
         base_pts, fl_flag, pod_bonus = parse_base_points(points_raw)
         rare_bonus, loyalty_bonus    = parse_car_bonus(car_bonus_raw)
@@ -648,6 +643,16 @@ def parse_race_sheet(rows: list):
             pts_total = int(points_total)
         except (ValueError, TypeError):
             pts_total = 0
+
+        # Bei DNF-Fahrern: Boni ignorieren wenn points_total=1
+        # (Sheet traegt Boni ein, aber Gesamt bleibt 1)
+        if is_dnf or pts_total <= 1:
+            # Nur wenn Gesamtpunkte <= Basispunkte: Boni auf 0 setzen
+            if pts_total <= base_pts:
+                fl_flag      = 0
+                pod_bonus    = 0
+                rare_bonus   = 0
+                loyalty_bonus = 0
 
         try:
             pen_pts = int(penalty_pts)
@@ -666,7 +671,8 @@ def parse_race_sheet(rows: list):
             "race_time":         seconds_to_timestr(time_no_penalty) if time_no_penalty else None,
             # race_time_final = Zeit mit Strafe (wie im Sheet in Spalte K)
             "race_time_final":   race_time_raw if not is_dnf else None,
-            "rating":            rating,
+            "time_no_penalty":   time_no_penalty,
+            "rating":            None,  # wird nach Einlesen aller Fahrer berechnet
             "base_points":       base_pts,
             "fl_flag":           fl_flag,
             "podium_bonus":      pod_bonus,
@@ -678,6 +684,27 @@ def parse_race_sheet(rows: list):
 
     if not entries:
         return None
+
+    # Siegerzeit ermitteln (Pos 1, ohne Strafe)
+    winner_time = None
+    for e in entries:
+        if e["finish_pos"] == 1 and e["time_no_penalty"] is not None:
+            winner_time = e["time_no_penalty"]
+            break
+
+    # Rating und finish_pos_grid berechnen
+    from collections import defaultdict
+    grid_counters = defaultdict(int)
+    for entry in sorted(entries, key=lambda e: e["finish_pos"]):
+        # Rating = eigene Zeit / Siegerzeit * 100 (in Prozent, 2 Nachkommastellen)
+        if entry["time_no_penalty"] and winner_time and winner_time > 0:
+            entry["rating"] = round(entry["time_no_penalty"] / winner_time * 100, 2)
+        else:
+            entry["rating"] = None
+        # finish_pos_grid: Position innerhalb des Grids
+        gn = entry["grid_number"]
+        grid_counters[gn] += 1
+        entry["finish_pos_grid"] = grid_counters[gn]
 
     return {
         "race_date":        race_date,
@@ -786,10 +813,14 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
         bonus_total = (entry["fl_flag"] + entry["podium_bonus"]
                        + entry["rare_bonus"] + entry["loyalty_bonus"])
 
+        if entry["rating"] is None and entry["status"] != "DNF":
+            log.warning(f"  Rating nicht berechnet fuer {psn} "
+                        f"(Siegerzeit nicht ermittelbar)")
+
         cur.execute(
             """INSERT INTO race_results
                (race_id, grid_id, driver_id, vehicle_id, team_id,
-                finish_pos_overall,
+                finish_pos_overall, finish_pos_grid,
                 race_time, race_time_final,
                 rating_at_race,
                 points_base, bonus_total,
@@ -799,7 +830,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 penalty_seconds, penalty_points)
                VALUES
                (%s,%s,%s,%s,%s,
-                %s,
+                %s,%s,
                 %s,%s,
                 %s,
                 %s,%s,
@@ -810,6 +841,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
             (
                 race_id, g_id, d_id, v_id, t_id,
                 entry["finish_pos"],
+                entry.get("finish_pos_grid"),
                 entry["race_time"],
                 entry["race_time_final"],
                 entry["rating"],
