@@ -378,6 +378,36 @@ def lookup_or_create_race(cur, season_id: int, race_number: int, data: dict):
     return race_id
 
 
+def ensure_grids(cur, race_id: int, grid_numbers: set):
+    """
+    Stellt sicher dass alle benoetigen Grid-Eintraege fuer race_id existieren.
+    Legt fehlende Grids automatisch an.
+    Grid-Labels: '1'=Grid 1, '2'=Grid 2, '3'=Grid 3
+    (Splitgrids '2a'/'2b' werden nicht aus dem Sheet generiert – nur wenn explizit vorhanden)
+    """
+    GRID_LABELS = {
+        "1": ("1", "Grid 1"),
+        "2": ("2", "Grid 2"),
+        "2a": ("2", "Grid 2a"),
+        "2b": ("2", "Grid 2b"),
+        "3": ("3", "Grid 3"),
+    }
+    for gn in sorted(grid_numbers):
+        cur.execute(
+            "SELECT grid_id FROM grids WHERE race_id = %s AND grid_number = %s",
+            (race_id, gn),
+        )
+        if cur.fetchone():
+            continue
+        grid_class, grid_label = GRID_LABELS.get(gn, (gn, f"Grid {gn}"))
+        cur.execute(
+            "INSERT INTO grids (race_id, grid_number, grid_class, grid_label) "
+            "VALUES (%s, %s, %s, %s)",
+            (race_id, gn, grid_class, grid_label),
+        )
+        log.info(f"  Grid '{gn}' fuer race_id={race_id} angelegt.")
+
+
 def lookup_grid(cur, race_id: int, grid_number: str):
     cur.execute(
         "SELECT grid_id FROM grids WHERE race_id = %s AND grid_number = %s",
@@ -560,6 +590,10 @@ def import_race(cur, season_id: int, race_number: int, data: dict):
         (race_id,)
     )
     cur.execute("DELETE FROM race_results WHERE race_id = %s", (race_id,))
+
+    # Alle benoetigten Grid-Nummern aus den Eintraegen sammeln und sicherstellen
+    grid_numbers_needed = {e["grid_number"] for e in data["entries"] if e["grid_number"]}
+    ensure_grids(cur, race_id, grid_numbers_needed)
 
     inserted = 0
     for entry in data["entries"]:
