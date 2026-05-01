@@ -593,7 +593,6 @@ def parse_race_sheet(rows: list):
         psn_name     = cell(row, 3)
         team_name    = cell(row, 4)
         vehicle_name = cell(row, 5)
-        livery_code  = cell(row, 6)
         grid_number  = cell(row, 7)
         penalty_raw  = cell(row, 8)
         penalty_pts  = cell(row, 9)
@@ -645,7 +644,6 @@ def parse_race_sheet(rows: list):
             "psn_name":          psn_name,
             "team_name":         team_name,
             "vehicle_name":      vehicle_name,
-            "livery_code":       livery_code or None,
             "grid_number":       grid_number,
             "penalty_sec":       penalty_sec,
             "penalty_pts":       pen_pts,
@@ -782,8 +780,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 bonus_fastest_lap, bonus_podium,
                 bonus_rare_vehicle, bonus_vehicle_loyalty,
                 points_total, status,
-                penalty_seconds, penalty_points,
-                livery_code)
+                penalty_seconds, penalty_points)
                VALUES
                (%s,%s,%s,%s,%s,
                 %s,
@@ -793,8 +790,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 %s,%s,
                 %s,%s,
                 %s,%s,
-                %s,%s,
-                %s)""",
+                %s,%s)""",
             (
                 race_id, g_id, d_id, v_id, t_id,
                 entry["finish_pos"],
@@ -811,7 +807,6 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 entry["status"],
                 entry["penalty_sec"],
                 entry["penalty_pts"],
-                entry["livery_code"],
             ),
         )
         result_id = cur.lastrowid
