@@ -148,11 +148,26 @@ def parse_info_sheet(rows: list) -> dict:
       B=1: Rennnummer, C=2: Datum, E=4: Track (sheet_name),
       F=5: Laps, G=6: Time of Day, H=7: Weather Code
 
+    Die Startzeile wird dynamisch ermittelt: erste Zeile nach der Zeile
+    in der Spalte B (Index 1) den Wert '#' enthaelt.
+
     Gibt dict zurueck: {race_number: {race_date, track_name, laps, time_of_day, weather_code}}
     Zeilen ohne Rennnummer (Pausen) werden uebersprungen.
     """
+    # Kopfzeile suchen: Zeile mit '#' in Spalte B
+    start_idx = None
+    for i, row in enumerate(rows):
+        val = str(row[1]).strip() if len(row) > 1 else ""
+        if val == "#":
+            start_idx = i + 1  # Daten beginnen eine Zeile darunter
+            break
+
+    if start_idx is None:
+        log.warning("Info-Sheet: Kopfzeile mit '#' nicht gefunden, überspringe Kalender.")
+        return {}
+
     calendar = {}
-    for row in rows[23:]:  # ab Zeile 24 (Index 23)
+    for row in rows[start_idx:]:
         rn_raw = str(row[1]).strip() if len(row) > 1 else ""
         if not rn_raw or not rn_raw.isdigit():
             continue  # Pause oder Leerzeile
@@ -188,7 +203,7 @@ def parse_info_sheet(rows: list) -> dict:
             "weather_code": c(7) or None,
         }
 
-    log.info(f"Info-Sheet: {len(calendar)} Rennen im Kalender gefunden.")
+    log.info(f"Info-Sheet: {len(calendar)} Rennen im Kalender gefunden (ab Zeile {start_idx + 1}).")
     return calendar
 
 
