@@ -965,9 +965,16 @@ def main():
         except Exception as e:
             log.warning(f"Info-Sheet konnte nicht geladen werden: {e} – fahre ohne Kalender fort.")
 
-        # Verfuegbare numerische Tabs ermitteln
+        # Verfuegbare numerische Tabs ermitteln (dedupliziert)
         tabs = list_sheet_tabs(svc, sheet_id)
-        race_tabs = sorted([t for t in tabs if t.isdigit()], key=lambda x: int(x))
+        log.info(f"Alle Sheet-Tabs: {tabs}")
+        seen = set()
+        race_tabs = []
+        for t in tabs:
+            if t.strip().isdigit() and t.strip() not in seen:
+                seen.add(t.strip())
+                race_tabs.append(t.strip())
+        race_tabs.sort(key=lambda x: int(x))
 
         if args.race:
             if str(args.race) not in race_tabs:
