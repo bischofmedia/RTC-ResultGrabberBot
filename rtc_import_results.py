@@ -776,7 +776,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
     # Alten Stand fuer Change-Detection lesen (vor dem Loeschen)
     cur.execute(
         "SELECT driver_id, penalty_seconds, finish_pos_overall, points_total, "
-        "rating_at_race, finish_pos_grid "
+        "time_percent, finish_pos_grid "
         "FROM race_results WHERE race_id = %s",
         (race_id,)
     )
@@ -825,7 +825,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                (race_id, grid_id, driver_id, vehicle_id, team_id,
                 finish_pos_overall, finish_pos_grid,
                 race_time, race_time_final,
-                rating_at_race,
+                time_percent,
                 points_base, bonus_total,
                 bonus_fastest_lap, bonus_podium,
                 bonus_rare_vehicle, bonus_vehicle_loyalty,
@@ -847,7 +847,7 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
                 entry.get("finish_pos_grid"),
                 entry["race_time"],
                 entry["race_time_final"],
-                entry["rating"],
+                entry["rating"],  # time_percent: eigene Zeit / Siegerzeit * 100
                 entry["base_points"],
                 bonus_total,
                 1 if entry["fl_flag"] else 0,
@@ -891,10 +891,10 @@ def import_race(cur, season_id: int, race_number: int, data: dict, cal: dict = N
             if old_pen != pen:
                 new_penalties += 1
 
-        # Change-Detection: Rating neu oder geaendert?
+        # Change-Detection: time_percent neu oder geaendert?
         old = old_rows.get(d_id) or {}
         new_rating = entry["rating"]
-        old_rating = old.get("rating_at_race")
+        old_rating = old.get("time_percent")
         if new_rating is not None and (old_rating is None or
                 abs(float(old_rating) - float(new_rating)) > 0.01):
             ratings_updated += 1
