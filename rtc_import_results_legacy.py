@@ -1020,7 +1020,7 @@ def main():
         svc = get_sheets_service()
 
         # Info-Tab-Name ermitteln: Saison 8 hat abweichenden Tab-Namen
-        INFO_TAB_NAMES = ["Info", "RTC_S2_2022"]
+        INFO_TAB_NAMES = ["Info", "RTC_S2-2022"]
         all_tabs = list_sheet_tabs(svc, sheet_id)
         info_tab = next((t for t in INFO_TAB_NAMES if t in all_tabs), None)
 
