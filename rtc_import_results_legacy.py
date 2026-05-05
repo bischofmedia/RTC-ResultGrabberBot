@@ -624,17 +624,16 @@ def parse_race_sheet(rows: list):
                   or race_time_raw.upper() == "DNF")
         status = "DNF" if is_dnf else "FIN"
 
-        # Zeiten
-        # Im Legacy-Format ist J bereits die finale Zeit inkl. Strafabzug
-        # race_time_final = race_time (kein separates Feld ohne Strafe im Sheet)
+        # Spalte J = RaceTime MIT Strafe (finale Zeit, nach der sortiert wird)
+        # race_time (ohne Strafe) = J - penalty
         race_time_sec = parse_time_to_seconds(race_time_raw) if not is_dnf else None
         penalty_sec   = parse_penalty_seconds(penalty_raw)
 
-        # Zeit ohne Strafe = finale Zeit + Strafsekunden zurueckrechnen
         if race_time_sec is not None:
-            time_no_penalty = race_time_sec + penalty_sec if penalty_sec else race_time_sec
+            time_no_penalty = race_time_sec - penalty_sec if penalty_sec else race_time_sec
         else:
             time_no_penalty = None
+        race_time_final_str = race_time_raw if not is_dnf else None
 
         # Punkte (keine Car-Boni in diesen Saisons)
         base_pts, fl_flag, pod_bonus = parse_base_points(points_raw)
@@ -659,9 +658,9 @@ def parse_race_sheet(rows: list):
             "vehicle_name":      vehicle_name,
             "grid_number":       grid_number,
             "penalty_sec":       penalty_sec,
-            "penalty_pts":       0,            # kein PenaltyPoints-Feld in Legacy
+            "penalty_pts":       0,
             "race_time":         seconds_to_timestr(time_no_penalty) if time_no_penalty else None,
-            "race_time_final":   race_time_raw if not is_dnf else None,
+            "race_time_final":   race_time_final_str,
             "time_no_penalty":   time_no_penalty,
             "rating":            None,
             "base_points":       base_pts,
