@@ -23,7 +23,8 @@ import argparse
 import urllib.request
 import urllib.error
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pymysql
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ ENV_PATH = "/etc/RTC_RaceResultBot-env"
 load_dotenv(ENV_PATH)
 
 DB_HOST         = os.getenv("DB_HOST")
+BERLIN          = ZoneInfo("Europe/Berlin")
 DB_USER         = os.getenv("DB_USER")
 DB_PASSWORD     = os.getenv("DB_PASSWORD")
 DB_NAME         = os.getenv("DB_NAME")
@@ -1032,6 +1034,34 @@ def main():
             cal = parse_info_sheet(info_rows)
         except Exception as e:
             log.warning(f"Info-Sheet konnte nicht geladen werden: {e} – fahre ohne Kalender fort.")
+
+        # Datum-Pruefung: Sync nur innerhalb des Saison-Fensters
+        # (ab erstem Rennen bis 1 Tag nach letztem Rennen)
+        # Wird uebersprungen wenn --race explizit angegeben oder kein Kalender geladen
+        if cal and not args.race:
+            race_dates = [v["race_date"] for v in cal.values() if v.get("race_date")]
+            if race_dates:
+                first_race = min(race_dates)
+                last_race  = max(race_dates)
+                today      = datetime.now(tz=BERLIN).date()
+                deadline   = last_race + timedelta(days=1)
+
+                if today < first_race:
+                    log.info(
+                        f"Sync uebersprungen: Saison beginnt erst am {first_race} "
+                        f"(heute: {today})."
+                    )
+                    sys.exit(0)
+                elif today > deadline:
+                    log.info(
+                        f"Sync uebersprungen: Saison endete am {last_race}, "
+                        f"Sync-Fenster war bis {deadline} (heute: {today})."
+                    )
+                    sys.exit(0)
+                else:
+                    log.info(
+                        f"Sync-Fenster aktiv: {first_race} – {deadline} (heute: {today})."
+                    )
 
         # Verfuegbare numerische Tabs ermitteln (dedupliziert)
         tabs = list_sheet_tabs(svc, sheet_id)
