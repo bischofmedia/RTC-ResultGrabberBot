@@ -113,6 +113,9 @@ def get_db():
         database=DB_NAME, charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
     )
 
 
@@ -1005,6 +1008,14 @@ def main():
 
         season_id = season["season_id"]
         sheet_id  = season["sheet_id"]
+
+        # Sicherungssperre: Saisons vor ID 12 haben ein anderes Sheet-Format
+        if season_id < 12:
+            log.error(
+                f"Saison {season_id} ({season['name']}) hat ein aelteres Sheet-Format "
+                f"das von diesem Script nicht unterstuetzt wird (nur season_id >= 12)."
+            )
+            sys.exit(1)
 
         if not sheet_id:
             log.error(f"Keine sheet_id in seasons fuer Saison {season_id} hinterlegt!")
