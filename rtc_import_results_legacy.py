@@ -601,7 +601,16 @@ def parse_race_sheet(rows: list):
             log.warning(f"  Datum nicht parsbar: '{race_date_str}'")
 
     entries = []
-    for row in rows[6:]:
+    # Startzeile dynamisch ermitteln: erste Zeile ab Index 4 wo Spalte B eine Zahl ist
+    # (Season 8 startet bei Index 5, andere bei Index 6)
+    data_start = None
+    for i, row in enumerate(rows[4:], start=4):
+        val = str(row[1]).strip() if len(row) > 1 else ""
+        if val.isdigit():
+            data_start = i
+            break
+
+    for row in rows[data_start:] if data_start is not None else []:
         pos_raw = cell(row, 1)
         if not pos_raw or not pos_raw.isdigit():
             continue
