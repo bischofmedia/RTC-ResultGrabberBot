@@ -1113,11 +1113,15 @@ def main():
             f"{skipped} uebersprungen, {errors} Fehler."
         )
 
-        # Discord-Log nur wenn etwas passiert ist
-        if changes:
+        # Discord-Log – immer, damit man sieht dass der Cron gelaufen ist
+        if changes or errors:
             _post_discord_summary(season["name"], changes, errors)
-        elif errors:
-            discord_notify([f"⚠️ **DB-Import {season['name']}** – {errors} Fehler aufgetreten, nichts importiert."])
+        else:
+            now_str = datetime.now(tz=BERLIN).strftime("%d.%m.%Y %H:%M")
+            discord_notify([
+                f"🗄️ **DB-Import {season['name']}** – {now_str}",
+                f"  ✔️ Keine Änderungen – {imported} Rennen geprüft, alles aktuell."
+            ])
 
         if errors:
             sys.exit(1)
